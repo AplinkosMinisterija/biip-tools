@@ -1,0 +1,17 @@
+name: Continuous integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate-docker-build:
+    name: Validate if docker image builds
+    uses: AplinkosMinisterija/reusable-workflows/.github/workflows/docker-build-push.yml@main
+    with:
+      docker-image: ghcr.io/aplinkosministerija/example
+      environment: test
+      runs-on: ubuntu-latest
+      latest-tag: true
+      push: false

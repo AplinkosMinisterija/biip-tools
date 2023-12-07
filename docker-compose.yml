@@ -1,0 +1,18 @@
+version: '3.3'
+
+services:
+  chrome:
+    image: browserless/chrome:latest
+    restart: unless-stopped
+    environment:
+      DEFAULT_LAUNCH_ARGS: '["--window-size=1920,1080"]'
+    networks:
+      - internal
+    ports:
+      - 9321:3000
+
+networks:
+  internal:
+
+volumes:
+  data:

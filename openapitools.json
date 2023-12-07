@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/@openapitools/openapi-generator-cli/config.schema.json",
+  "spaces": 2,
+  "generator-cli": {
+    "version": "6.6.0",
+    "generators": {
+      "biip-tools-client": {
+        "generatorName": "typescript-fetch",
+        "inputSpec": "https://internalapi.biip.lt/tools/openapi/openapi.json",
+        "output": "generated-sources/biip-tools-client",
+        "gitUserId": "aplinkosministerija",
+        "gitRepoId": "biip-tools",
+        "additionalProperties": {
+          "npmName": "@aplinkosministerija/biip-tools-client",
+          "npmRepository": "https://registry.npmjs.org",
+          "supportsES6": true,
+          "withInterfaces": true
+        }
+      }
+    }
+  }
+}
