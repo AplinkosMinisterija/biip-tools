@@ -18,6 +18,7 @@ import { boundariesConfig } from '../knexfile';
       rest: '/boundaries/municipalities',
       createActions: {
         create: false,
+        replace: false,
         update: false,
         remove: false,
         get: false,
