@@ -32,7 +32,7 @@ import { boundariesConfig } from '../knexfile';
 
   settings: {
     fields: {
-      id: {
+      code: {
         type: 'string',
         columnType: 'integer',
         primaryKey: true,
@@ -48,6 +48,8 @@ import { boundariesConfig } from '../knexfile';
 
       email: 'string',
       name: 'string',
+      area: 'number',
+      municipalityCode: 'string',
     },
   },
 })

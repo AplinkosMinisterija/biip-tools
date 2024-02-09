@@ -32,13 +32,6 @@ import { boundariesConfig } from '../knexfile';
 
   settings: {
     fields: {
-      id: {
-        type: 'string',
-        columnType: 'integer',
-        primaryKey: true,
-        secure: true,
-      },
-
       code: {
         type: 'string',
         columnType: 'integer',
@@ -54,6 +47,8 @@ import { boundariesConfig } from '../knexfile';
       },
 
       name: 'string',
+      area: 'number',
+      countyCode: 'string',
     },
   },
 })

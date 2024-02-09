@@ -9,13 +9,13 @@ import PostgisMixin from 'moleculer-postgis';
 import { boundariesConfig } from '../knexfile';
 
 @Service({
-  name: 'boundaries.counties',
+  name: 'boundaries.residentialAreas',
 
   mixins: [
     DbConnection({
-      collection: 'counties',
+      collection: 'residentialAreas',
       config: boundariesConfig,
-      rest: '/boundaries/counties',
+      rest: '/boundaries/residentialAreas',
       createActions: {
         create: false,
         replace: false,
@@ -48,7 +48,8 @@ import { boundariesConfig } from '../knexfile';
 
       name: 'string',
       area: 'number',
+      municipalityCode: 'string',
     },
   },
 })
-export default class BoundariesCountiesService extends moleculer.Service {}
+export default class BoundariesResidentialAreasService extends moleculer.Service {}
