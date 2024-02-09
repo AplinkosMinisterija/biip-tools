@@ -21,7 +21,6 @@ import { boundariesConfig } from '../knexfile';
         replace: false,
         update: false,
         remove: false,
-        get: false,
         createMany: false,
         removeAllEntities: false,
       },
