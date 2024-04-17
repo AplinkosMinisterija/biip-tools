@@ -34,6 +34,11 @@ export default class DownloadService extends moleculer.Service {
         type: 'string',
         $$t: 'Filename',
       },
+      headers: {
+        type: 'object',
+        optional: true,
+        $$t: 'Custom request headers',
+      },
     },
     rest: ['GET /'],
     timeout: 0,
@@ -43,6 +48,7 @@ export default class DownloadService extends moleculer.Service {
       {
         url: string;
         name: string;
+        headers: any;
       },
       {
         $responseType: string;
@@ -52,9 +58,9 @@ export default class DownloadService extends moleculer.Service {
       }
     >,
   ) {
-    const { url, name } = ctx.params;
+    const { url, name, headers } = ctx.params;
 
-    return fetch(url)
+    return fetch(url, { headers })
       .then((response) => {
         ctx.meta.$responseType = response.headers.get('Content-Type');
         ctx.meta.$statusCode = response.status;
