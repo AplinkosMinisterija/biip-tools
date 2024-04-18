@@ -1,6 +1,7 @@
-import moleculer from 'moleculer';
+import moleculer, {Context} from 'moleculer';
 import { Action, Service } from 'moleculer-decorators';
 import ApiGateway from 'moleculer-web';
+import { RequestMessage} from "../types";
 
 @Service({
   name: 'api',
@@ -57,7 +58,21 @@ import ApiGateway from 'moleculer-web';
         // The gateway will dynamically build the full routes from service schema.
         autoAliases: true,
 
-        aliases: {},
+        aliases: {
+
+        },
+        onBeforeCall: (ctx: Context<{}, {headers: any}>, route: any, req: RequestMessage) => {
+          //whitelist headers here
+          const supportedHeaders = ['authorization'];
+          const requestHeaders: any = {};
+          for(const key in req.headers) {
+            const value = req.headers[key]
+            if(supportedHeaders.includes(key)) {
+              requestHeaders[key] = value;
+            }
+          }
+          ctx.meta.headers = requestHeaders;
+        },
         /**
 			* Before call hook. You can check the request.
 			* @param {Context} ctx
