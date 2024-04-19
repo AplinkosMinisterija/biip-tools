@@ -49,12 +49,15 @@ export default class DownloadService extends moleculer.Service {
         $statusCode: number;
         $statusMessage: string;
         $responseHeaders: any;
+        headers: any;
       }
     >,
   ) {
+    const { headers } = ctx.meta;
+
     const { url, name } = ctx.params;
 
-    return fetch(url)
+    return fetch(url, { headers })
       .then((response) => {
         ctx.meta.$responseType = response.headers.get('Content-Type');
         ctx.meta.$statusCode = response.status;
