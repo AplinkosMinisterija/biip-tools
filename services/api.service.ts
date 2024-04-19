@@ -1,7 +1,7 @@
 import moleculer, {Context} from 'moleculer';
 import { Action, Service } from 'moleculer-decorators';
 import ApiGateway from 'moleculer-web';
-import { RequestMessage} from "../types";
+import {RequestHeaders, RequestMessage} from "../types";
 
 @Service({
   name: 'api',
@@ -61,15 +61,10 @@ import { RequestMessage} from "../types";
         aliases: {
 
         },
-        onBeforeCall: (ctx: Context<{}, {headers: any}>, route: any, req: RequestMessage) => {
-          //whitelist headers here
-          const supportedHeaders = ['authorization'];
-          const requestHeaders: any = {};
-          for(const key in req.headers) {
-            const value = req.headers[key]
-            if(supportedHeaders.includes(key)) {
-              requestHeaders[key] = value;
-            }
+        onBeforeCall: (ctx: Context<{}, { headers: any }>, route: any, req: RequestMessage) => {
+          const requestHeaders: RequestHeaders  = {};
+          if(req.headers.authorization) {
+            requestHeaders.authorization = req.headers.authorization;
           }
           ctx.meta.headers = requestHeaders;
         },

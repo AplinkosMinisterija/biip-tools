@@ -64,3 +64,8 @@ export interface RequestMessage extends IncomingMessage {
   $params: ActionParamSchema;
   $route: RouteSchema;
 }
+
+
+export interface RequestHeaders {
+  authorization?: string
+}
