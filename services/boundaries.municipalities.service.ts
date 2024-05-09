@@ -1,7 +1,7 @@
 'use strict';
 
 import moleculer, { Context } from 'moleculer';
-import { Action, Service } from 'moleculer-decorators';
+import { Service } from 'moleculer-decorators';
 
 import DbConnection from '../mixins/database.mixin';
 
