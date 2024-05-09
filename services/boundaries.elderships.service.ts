@@ -1,12 +1,13 @@
 'use strict';
 
-import moleculer from 'moleculer';
+import moleculer, { Context } from 'moleculer';
 import { Service } from 'moleculer-decorators';
 
 import DbConnection from '../mixins/database.mixin';
 
 import PostgisMixin from 'moleculer-postgis';
 import { boundariesConfig } from '../knexfile';
+import { CREATE_ONLY_READ_ACTIONS } from '../types';
 
 @Service({
   name: 'boundaries.elderships',
@@ -15,15 +16,7 @@ import { boundariesConfig } from '../knexfile';
     DbConnection({
       collection: 'elderships',
       config: boundariesConfig,
-      rest: '/boundaries/elderships',
-      createActions: {
-        create: false,
-        replace: false,
-        update: false,
-        remove: false,
-        createMany: false,
-        removeAllEntities: false,
-      },
+      createActions: CREATE_ONLY_READ_ACTIONS,
     }),
     PostgisMixin({
       srid: 3346,
@@ -49,7 +42,12 @@ import { boundariesConfig } from '../knexfile';
       email: 'string',
       name: 'string',
       area: 'number',
-      municipalityCode: 'string',
+      municipality: {
+        type: 'string',
+        columnName: 'municipalityCode',
+        populate: (ctx: Context, values: string[]) =>
+          ctx.call('boundaries.municipalities.resolve', { code: values, mapping: true }),
+      },
     },
   },
 })

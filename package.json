@@ -54,7 +54,7 @@
     "@moleculer/database": "ambrazasp/moleculerjs-database",
     "@sentry/node": "^7.61.0",
     "dotenv": "^16.0.0",
-    "knex": "2",
+    "knex": "^3.1.0",
     "lodash": "^4.17.21",
     "mime-types": "^2.1.35",
     "mkdirp": "^1.0.4",

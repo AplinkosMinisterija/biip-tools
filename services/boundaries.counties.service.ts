@@ -7,6 +7,7 @@ import DbConnection from '../mixins/database.mixin';
 
 import PostgisMixin from 'moleculer-postgis';
 import { boundariesConfig } from '../knexfile';
+import { CREATE_ONLY_READ_ACTIONS } from '../types';
 
 @Service({
   name: 'boundaries.counties',
@@ -15,15 +16,7 @@ import { boundariesConfig } from '../knexfile';
     DbConnection({
       collection: 'counties',
       config: boundariesConfig,
-      rest: '/boundaries/counties',
-      createActions: {
-        create: false,
-        replace: false,
-        update: false,
-        remove: false,
-        createMany: false,
-        removeAllEntities: false,
-      },
+      createActions: CREATE_ONLY_READ_ACTIONS,
     }),
     PostgisMixin({
       srid: 3346,
