@@ -90,13 +90,16 @@ import ApiGateway from 'moleculer-web';
         callingOptions: {},
 
         bodyParsers: {
+          // 25MB accommodates GeoJSON payloads for the /gdb endpoint, which
+          // can be several MB for requests with many objects. Other endpoints
+          // (/pdf, /download, /screenshot) take URL params and are unaffected.
           json: {
             strict: false,
-            limit: '1MB',
+            limit: '25MB',
           },
           urlencoded: {
             extended: true,
-            limit: '1MB',
+            limit: '25MB',
           },
         },
 
