@@ -43,9 +43,12 @@ export default class GdbService extends moleculer.Service {
         type: 'string',
         optional: true,
         default: 'extract',
-        pattern: '^[A-Za-z0-9._-]+$',
+        // Defense in depth: even with shell:false + absolute paths, disallow
+        // leading - or . to avoid edge-case argv parsing (--foo, ..) and bare
+        // dotfiles. Also cap length.
+        pattern: '^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$',
         $$t:
-          'Base name for the .gdb directory inside the ZIP (must be a safe filename — letters, digits, dot, dash, underscore)',
+          'Base name for the .gdb directory inside the ZIP (alnum start; up to 64 chars of letters, digits, dot, dash, underscore)',
       },
     },
     rest: ['POST /'],
@@ -133,12 +136,13 @@ export default class GdbService extends moleculer.Service {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
       });
-      const stderrChunks: Buffer[] = [];
-      child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+      const stderrChunks: string[] = [];
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
       child.on('error', reject);
       child.on('close', (code) => {
         if (code === 0) return resolve();
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
+        const stderr = stderrChunks.join('');
         reject(
           new Errors.MoleculerError(
             `ogr2ogr exited with code ${code}: ${stderr || '<no stderr>'}`,
@@ -158,12 +162,13 @@ export default class GdbService extends moleculer.Service {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
       });
-      const stderrChunks: Buffer[] = [];
-      child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+      const stderrChunks: string[] = [];
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
       child.on('error', reject);
       child.on('close', (code) => {
         if (code === 0) return resolve();
-        const stderr = Buffer.concat(stderrChunks).toString('utf8');
+        const stderr = stderrChunks.join('');
         reject(
           new Errors.MoleculerError(
             `zip exited with code ${code}: ${stderr || '<no stderr>'}`,
