@@ -19,8 +19,16 @@ import { Integrations } from '@sentry/node';
         environment: process.env.ENVIRONMENT,
         release: process.env.VERSION,
         tracesSampleRate: 1,
-        integrations: [
-          // enable HTTP calls tracing
+        // Disable the bundled Undici integration: @sentry/node 7.61.0's
+        // `setHeadersOnRequest` calls `request.headers.split()`, which
+        // crashes on newer Node 20 / undici where `request.headers` is an
+        // Array rather than a string. Every fetch() from this process
+        // (e.g. /tools/pdf → chrome) was triggering the crash, taking the
+        // whole tools container down on every PDF request. We keep the
+        // other default integrations (InboundFilters, FunctionToString,
+        // ConsoleBreadcrumbs, etc) plus our explicit Http/Postgres.
+        integrations: (defaultIntegrations: any[]) => [
+          ...defaultIntegrations.filter((i) => i.name !== 'Undici'),
           new Integrations.Http({ tracing: true }),
           new Integrations.Postgres(),
         ],
