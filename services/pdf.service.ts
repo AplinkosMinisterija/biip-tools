@@ -92,6 +92,13 @@ export default class PdfService extends moleculer.Service {
         optional: true,
         $$t: 'Margins in pixels',
       },
+      landscape: {
+        type: 'boolean',
+        default: false,
+        convert: true,
+        optional: true,
+        $$t: 'Render the PDF in landscape orientation',
+      },
     },
     rest: ['POST /'],
     timeout: 0,
@@ -104,6 +111,7 @@ export default class PdfService extends moleculer.Service {
         width: number;
         footer: string;
         header: string;
+        landscape: boolean;
         margin?: {
           top?: number;
           bottom?: number;
@@ -121,7 +129,7 @@ export default class PdfService extends moleculer.Service {
     const host = process.env.CHROME_API_ENDPOINT || 'http://localhost:9321';
     const pdfUrl = `${host}/pdf`;
 
-    const { url, height, width, margin, footer, header } = ctx.params;
+    const { url, height, width, margin, footer, header, landscape } = ctx.params;
 
     const options: any = {
       width: `${height}px`,
@@ -131,6 +139,7 @@ export default class PdfService extends moleculer.Service {
       footerTemplate: footer,
       displayHeaderFooter: true,
       format: 'A4',
+      landscape: !!landscape,
       margin: {
         top: `${margin?.top || 50}px`,
         left: `${margin?.left || 50}px`,
