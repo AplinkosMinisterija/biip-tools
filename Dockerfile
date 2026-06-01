@@ -1,8 +1,10 @@
 # Stage 1: Base image
 FROM node:20-alpine as base
 
-# Required for dependencies coming from git
-RUN apk add --no-cache git
+# Required for dependencies coming from git, plus gdal-tools (ogr2ogr) for
+# the /gdb endpoint that converts GeoJSON to ESRI File Geodatabase, and zip
+# to package the .gdb directory tree as a single archive.
+RUN apk add --no-cache git gdal-tools zip
 
 # Stage 2: Builder image
 FROM base as builder
