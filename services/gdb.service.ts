@@ -27,9 +27,33 @@ export default class GdbService extends moleculer.Service {
       },
     },
     params: {
+      // Backward-compatible: pass `geojson` (single FeatureCollection) for a
+      // one-layer GDB, OR pass `layers: [{ name, geojson }]` to produce a
+      // multi-layer GDB. OpenFileGDB requires one geometry type per layer, so
+      // callers needing to bundle mixed Points + Lines + Polygons must use
+      // `layers` and split features by geometry.type themselves.
       geojson: {
         type: 'object',
-        $$t: 'GeoJSON FeatureCollection to convert',
+        optional: true,
+        $$t: 'GeoJSON FeatureCollection to convert (single-layer mode).',
+      },
+      layers: {
+        type: 'array',
+        optional: true,
+        items: {
+          type: 'object',
+          props: {
+            name: {
+              type: 'string',
+              // Layer-name rules match what ogr2ogr / OpenFileGDB accept and
+              // what the call site needs to splat into -nln safely.
+              pattern: '^[A-Za-z_][A-Za-z0-9_]{0,30}$',
+            },
+            geojson: 'object',
+          },
+        },
+        $$t:
+          'Per-layer GeoJSON FeatureCollections (multi-layer mode). Each layer becomes its own table inside the .gdb; use this when objects of different geometry types must be bundled together.',
       },
       srid: {
         type: 'number',
@@ -56,7 +80,12 @@ export default class GdbService extends moleculer.Service {
   })
   async create(
     ctx: Context<
-      { geojson: any; srid: number; name: string },
+      {
+        geojson?: any;
+        layers?: Array<{ name: string; geojson: any }>;
+        srid: number;
+        name: string;
+      },
       {
         $responseType: string;
         $statusCode: number;
@@ -64,42 +93,86 @@ export default class GdbService extends moleculer.Service {
       }
     >,
   ) {
-    const { geojson, srid, name } = ctx.params;
+    const { geojson, layers, srid, name } = ctx.params;
 
-    if (!geojson?.type || geojson.type !== 'FeatureCollection') {
+    // Normalize both shapes into a single layers[] list so the rest of the
+    // pipeline doesn't branch. Single-layer callers get an auto-named layer
+    // matching the archive's `name` (the historical behaviour).
+    const inputLayers: Array<{ name: string; geojson: any }> = (() => {
+      if (Array.isArray(layers) && layers.length) return layers;
+      if (geojson) return [{ name, geojson }];
       throw new Errors.MoleculerClientError(
-        'geojson must be a FeatureCollection',
+        'either `geojson` or `layers` is required',
         400,
-        'INVALID_GEOJSON',
+        'NO_INPUT',
       );
+    })();
+
+    for (const layer of inputLayers) {
+      if (
+        !layer.geojson?.type ||
+        layer.geojson.type !== 'FeatureCollection'
+      ) {
+        throw new Errors.MoleculerClientError(
+          `layer "${layer.name}": geojson must be a FeatureCollection`,
+          400,
+          'INVALID_GEOJSON',
+        );
+      }
+      if (
+        !Array.isArray(layer.geojson.features) ||
+        layer.geojson.features.length === 0
+      ) {
+        throw new Errors.MoleculerClientError(
+          `layer "${layer.name}": features must be a non-empty array`,
+          400,
+          'EMPTY_FEATURES',
+        );
+      }
     }
-    if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
-      throw new Errors.MoleculerClientError(
-        'geojson.features must be a non-empty array',
-        400,
-        'EMPTY_FEATURES',
-      );
+
+    // Reject duplicate layer names early — ogr2ogr would overwrite silently
+    // and the user would lose data without an obvious clue.
+    const seen = new Set<string>();
+    for (const l of inputLayers) {
+      if (seen.has(l.name)) {
+        throw new Errors.MoleculerClientError(
+          `duplicate layer name: "${l.name}"`,
+          400,
+          'DUPLICATE_LAYER',
+        );
+      }
+      seen.add(l.name);
     }
 
     const workDir = await fsp.mkdtemp(join(tmpdir(), `gdb-`));
-    const geojsonPath = join(workDir, `${name}.geojson`);
     const gdbDir = join(workDir, `${name}.gdb`);
     const zipPath = join(workDir, `${name}.zip`);
 
     try {
-      await fsp.writeFile(geojsonPath, JSON.stringify(geojson));
+      // First layer: create the .gdb. Subsequent layers: -update -append so
+      // each one becomes its own table inside the same .gdb directory.
+      for (let i = 0; i < inputLayers.length; i++) {
+        const layer = inputLayers[i];
+        const layerGeojsonPath = join(workDir, `${layer.name}.geojson`);
+        await fsp.writeFile(
+          layerGeojsonPath,
+          JSON.stringify(layer.geojson),
+        );
 
-      // ogr2ogr: GeoJSON -> OpenFileGDB. -a_srs assigns the input's spatial
-      // reference (GeoJSON spec defines CRS84 but biip uses 3346 throughout).
-      // Binary path is literal; inputs are paths inside our private workDir.
-      await this.runOgr2Ogr([
-        '-f',
-        'OpenFileGDB',
-        '-a_srs',
-        `EPSG:${srid}`,
-        gdbDir,
-        geojsonPath,
-      ]);
+        const ogrArgs = [
+          '-f',
+          'OpenFileGDB',
+          '-a_srs',
+          `EPSG:${srid}`,
+          '-nln',
+          layer.name,
+          ...(i === 0 ? [] : ['-update', '-append']),
+          gdbDir,
+          layerGeojsonPath,
+        ];
+        await this.runOgr2Ogr(ogrArgs);
+      }
 
       // Pack the .gdb directory at workDir root so the archive entry is
       // "<name>.gdb/..." (the conventional layout ArcGIS / QGIS expect).
