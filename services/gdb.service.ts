@@ -45,9 +45,18 @@ export default class GdbService extends moleculer.Service {
           props: {
             name: {
               type: 'string',
-              // Layer-name rules match what ogr2ogr / OpenFileGDB accept and
-              // what the call site needs to splat into -nln safely.
-              pattern: '^[A-Za-z_][A-Za-z0-9_]{0,30}$',
+              // Layer-name rules — what ogr2ogr / OpenFileGDB accept and
+              // what the call site can splat into -nln safely. Allow
+              // ASCII letters + LT diacritics (ąčęėįšųūž) + digits +
+              // underscore. Disallow whitespace, shell metacharacters,
+              // and path separators — ogr2ogr would launder spaces to
+              // underscores anyway, and the shell:false spawn would
+              // not interpret quotes, but rejecting them upfront keeps
+              // the contract predictable. fastest-validator's `pattern`
+              // runs without the `u` flag, so we can't use \p{L};
+              // diacritics are spelled out instead.
+              pattern:
+                '^[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž_][A-Za-z0-9ĄČĘĖĮŠŲŪŽąčęėįšųūž_]{0,63}$',
             },
             geojson: 'object',
           },
