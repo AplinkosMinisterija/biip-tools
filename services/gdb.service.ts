@@ -59,10 +59,40 @@ export default class GdbService extends moleculer.Service {
                 '^[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž_][A-Za-z0-9ĄČĘĖĮŠŲŪŽąčęėįšųūž_]{0,63}$',
             },
             geojson: 'object',
+            // Optional per-field alias / type overrides. When provided,
+            // the layer is fed through an OGR VRT wrapper so the
+            // generated .gdb carries the alternative names (what QGIS
+            // / ArcGIS surface in the attribute table headers). Field
+            // names not listed here keep their inferred String type
+            // and no alias.
+            fields: {
+              type: 'array',
+              optional: true,
+              items: {
+                type: 'object',
+                props: {
+                  name: 'string',
+                  alias: { type: 'string', optional: true },
+                  type: {
+                    type: 'enum',
+                    values: [
+                      'String',
+                      'Integer',
+                      'Integer64',
+                      'Real',
+                      'Date',
+                      'DateTime',
+                    ],
+                    optional: true,
+                    default: 'String',
+                  },
+                },
+              },
+            },
           },
         },
         $$t:
-          'Per-layer GeoJSON FeatureCollections (multi-layer mode). Each layer becomes its own table inside the .gdb; use this when objects of different geometry types must be bundled together.',
+          'Per-layer GeoJSON FeatureCollections (multi-layer mode). Each layer becomes its own table inside the .gdb; use this when objects of different geometry types must be bundled together. Each layer can optionally declare `fields[]` to set field types and display aliases via an OGR VRT wrapper.',
       },
       srid: {
         type: 'number',
@@ -91,7 +121,11 @@ export default class GdbService extends moleculer.Service {
     ctx: Context<
       {
         geojson?: any;
-        layers?: Array<{ name: string; geojson: any }>;
+        layers?: Array<{
+          name: string;
+          geojson: any;
+          fields?: Array<{ name: string; alias?: string; type?: string }>;
+        }>;
         srid: number;
         name: string;
       },
@@ -107,7 +141,11 @@ export default class GdbService extends moleculer.Service {
     // Normalize both shapes into a single layers[] list so the rest of the
     // pipeline doesn't branch. Single-layer callers get an auto-named layer
     // matching the archive's `name` (the historical behaviour).
-    const inputLayers: Array<{ name: string; geojson: any }> = (() => {
+    const inputLayers: Array<{
+      name: string;
+      geojson: any;
+      fields?: Array<{ name: string; alias?: string; type?: string }>;
+    }> = (() => {
       if (Array.isArray(layers) && layers.length) return layers;
       if (geojson) return [{ name, geojson }];
       throw new Errors.MoleculerClientError(
@@ -161,6 +199,10 @@ export default class GdbService extends moleculer.Service {
     try {
       // First layer: create the .gdb. Subsequent layers: -update -append so
       // each one becomes its own table inside the same .gdb directory.
+      // If a layer declares `fields`, wrap its GeoJSON in an OGR VRT XML
+      // first so the resulting .gdb carries the declared types + alias
+      // names; without VRT, ogr2ogr infers everything as String and the
+      // attribute table shows no aliases.
       for (let i = 0; i < inputLayers.length; i++) {
         const layer = inputLayers[i];
         const layerGeojsonPath = join(workDir, `${layer.name}.geojson`);
@@ -168,6 +210,11 @@ export default class GdbService extends moleculer.Service {
           layerGeojsonPath,
           JSON.stringify(layer.geojson),
         );
+
+        const ogrInputPath =
+          layer.fields?.length
+            ? await this.writeVrt(workDir, layer)
+            : layerGeojsonPath;
 
         const ogrArgs = [
           '-f',
@@ -178,7 +225,7 @@ export default class GdbService extends moleculer.Service {
           layer.name,
           ...(i === 0 ? [] : ['-update', '-append']),
           gdbDir,
-          layerGeojsonPath,
+          ogrInputPath,
         ];
         await this.runOgr2Ogr(ogrArgs);
       }
@@ -209,6 +256,64 @@ export default class GdbService extends moleculer.Service {
       await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
       throw e;
     }
+  }
+
+  // Wrap a layer's GeoJSON in an OGR VRT XML document that declares
+  // each listed field's type and alternativeName. ogr2ogr reads the
+  // VRT (which in turn references the on-disk GeoJSON) and writes
+  // OpenFileGDB tables that carry the types + aliases. Returns the
+  // path to the .vrt file — pass that to ogr2ogr instead of the raw
+  // .geojson.
+  //
+  // Without VRT, ogr2ogr's GeoJSON reader stores every property as
+  // String and has nowhere to put an alias, so the resulting .gdb
+  // attribute table reads like the snake_case field names with no
+  // human label and no numeric type info.
+  @Method
+  async writeVrt(
+    workDir: string,
+    layer: {
+      name: string;
+      geojson: any;
+      fields?: Array<{ name: string; alias?: string; type?: string }>;
+    },
+  ): Promise<string> {
+    // GeoJSON layer name == basename of the .geojson file (without the
+    // extension), so OGR can find it via the VRT's <SrcLayer>.
+    const geojsonLayerName = layer.name;
+    const geojsonPath = `${geojsonLayerName}.geojson`; // relative to workDir
+    const fieldXml = (layer.fields ?? [])
+      .map((f) => {
+        const attrs = [`name="${this.escapeXml(f.name)}"`];
+        if (f.type) attrs.push(`type="${this.escapeXml(f.type)}"`);
+        if (f.alias)
+          attrs.push(`alternativeName="${this.escapeXml(f.alias)}"`);
+        return `    <Field ${attrs.join(' ')}/>`;
+      })
+      .join('\n');
+    const vrtXml = [
+      '<OGRVRTDataSource>',
+      `  <OGRVRTLayer name="${this.escapeXml(layer.name)}">`,
+      `    <SrcDataSource relativeToVRT="1">${this.escapeXml(geojsonPath)}</SrcDataSource>`,
+      `    <SrcLayer>${this.escapeXml(geojsonLayerName)}</SrcLayer>`,
+      fieldXml,
+      '  </OGRVRTLayer>',
+      '</OGRVRTDataSource>',
+      '',
+    ].join('\n');
+    const vrtPath = join(workDir, `${layer.name}.vrt`);
+    await fsp.writeFile(vrtPath, vrtXml);
+    return vrtPath;
+  }
+
+  @Method
+  escapeXml(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
   }
 
   @Method
