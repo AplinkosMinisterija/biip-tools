@@ -16,3 +16,10 @@ jobs:
       environment: Staging
       enable-sentry: true
       docker-image: ghcr.io/AplinkosMinisterija/biip-tools
+      # Cold-cache builds run two full `yarn install` passes (builder stage
+      # with dev deps, then the production stage) concurrently on a 2-vCPU
+      # runner, which takes 14+ min and blew the reusable workflow's 15 min
+      # default: the 1.1.0 production build was cancelled mid-`yarn install`
+      # twice, and a staging build died the same way on 2026-06-16. Warm
+      # builds still finish in ~3 min; this only raises the ceiling.
+      timeout-minutes: 30
