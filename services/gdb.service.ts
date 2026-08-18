@@ -4,6 +4,7 @@ import moleculer, { Context } from 'moleculer';
 import { Action, Service } from 'moleculer-decorators';
 import {
   GDB_FORMAT,
+  VECTOR_EXPORT_TIMEOUT_MS,
   runVectorExport,
   VectorExportLayer,
   vectorExportParams,
@@ -30,7 +31,9 @@ export default class GdbService extends moleculer.Service {
     },
     params: vectorExportParams,
     rest: ['POST /'],
-    timeout: 0,
+    // Bound the request the same way the pipeline bounds itself; the
+    // previous `timeout: 0` meant an export could never be abandoned.
+    timeout: VECTOR_EXPORT_TIMEOUT_MS,
   })
   async create(
     ctx: Context<
@@ -50,6 +53,7 @@ export default class GdbService extends moleculer.Service {
     const { stream, size, filename, contentType } = await runVectorExport({
       ...ctx.params,
       format: GDB_FORMAT,
+      logger: this.logger,
     });
 
     ctx.meta.$responseType = contentType;

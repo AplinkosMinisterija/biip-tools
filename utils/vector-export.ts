@@ -6,6 +6,30 @@ import { Errors } from 'moleculer';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+// Guardrails for the shared ogr2ogr pipeline.
+//
+// These endpoints are unauthenticated (the gateway runs with
+// authentication/authorization off and whitelist ['**']), every layer costs
+// one GDAL process, and the body limit is 25MB. A minimal valid layer is
+// ~137 bytes, so without a cap one request can ask for ~180k sequential
+// ogr2ogr spawns — hours of CPU held by a single connection. Bound the fan-out
+// (layer count), the work per layer (feature count) and the wall clock
+// (deadline), so the worst case is bounded rather than merely unlikely.
+export const MAX_LAYERS = 32;
+export const MAX_TOTAL_FEATURES = 500_000;
+
+// Whole-pipeline budget, shared by every child process in one export. Also
+// used as the moleculer action timeout so the broker and the pipeline agree.
+export const VECTOR_EXPORT_TIMEOUT_MS = 10 * 60 * 1000;
+
+// Per-process ceiling, applied on top of whatever is left of the deadline.
+const SUBPROCESS_TIMEOUT_MS = 2 * 60 * 1000;
+
+// GDAL emits one warning per feature for common cases (e.g. MultiPolygon
+// features into a Polygon layer), so an uncapped stderr buffer grows with
+// feature count even on success.
+const MAX_STDERR_CHARS = 64 * 1024;
+
 export interface VectorExportField {
   name: string;
   alias?: string;
@@ -61,6 +85,7 @@ export const vectorExportParams = {
   layers: {
     type: 'array',
     optional: true,
+    max: MAX_LAYERS,
     items: {
       type: 'object',
       props: {
@@ -123,12 +148,21 @@ export const vectorExportParams = {
   },
 };
 
+// Just the slice of moleculer's LoggerInstance this module needs, so the util
+// stays decoupled from the service that owns the logger.
+export interface VectorExportLogger {
+  error: (...args: any[]) => void;
+}
+
 export interface VectorExportInput {
   geojson?: any;
   layers?: VectorExportLayer[];
   srid: number;
   name: string;
   format: VectorExportFormat;
+  // Pass the calling service's logger so subprocess stderr is recorded
+  // server-side instead of being returned to the caller.
+  logger?: VectorExportLogger;
 }
 
 export interface VectorExportResult {
@@ -141,22 +175,40 @@ export interface VectorExportResult {
 // Full export pipeline shared by the /gdb and /gpkg endpoints:
 // validate → temp dir → optional VRT wrapper → ogr2ogr per layer →
 // optional zip → readable stream that removes the temp dir on close.
-export async function runVectorExport(input: VectorExportInput): Promise<VectorExportResult> {
-  const { geojson, layers, srid, name, format } = input;
+// Normalize the two accepted input shapes into a single layers[] list and
+// enforce every limit, so the rest of the pipeline doesn't branch and the
+// guardrails can be unit-tested without touching the filesystem or GDAL.
+// Pure: throws MoleculerClientError (4xx) on any invalid input.
+export function resolveVectorExportLayers(
+  input: Pick<VectorExportInput, 'geojson' | 'layers' | 'name'>,
+): VectorExportLayer[] {
+  const { geojson, layers, name } = input;
 
-  // Normalize both shapes into a single layers[] list so the rest of the
-  // pipeline doesn't branch. Single-layer callers get an auto-named layer
-  // matching the export's `name` (the historical behaviour).
-  const inputLayers: VectorExportLayer[] = (() => {
-    if (Array.isArray(layers) && layers.length) return layers;
-    if (geojson) return [{ name, geojson }];
+  // Single-layer callers get an auto-named layer matching the export's `name`
+  // (the historical behaviour).
+  const inputLayers: VectorExportLayer[] =
+    Array.isArray(layers) && layers.length ? layers : geojson ? [{ name, geojson }] : [];
+
+  if (!inputLayers.length) {
     throw new Errors.MoleculerClientError(
       'either `geojson` or `layers` is required',
       400,
       'NO_INPUT',
     );
-  })();
+  }
 
+  // The `max` on the params schema only covers multi-layer mode; enforce the
+  // cap here too so single-layer callers and internal callers of
+  // runVectorExport() hit the same limit.
+  if (inputLayers.length > MAX_LAYERS) {
+    throw new Errors.MoleculerClientError(
+      `too many layers: ${inputLayers.length} (max ${MAX_LAYERS})`,
+      400,
+      'TOO_MANY_LAYERS',
+    );
+  }
+
+  let totalFeatures = 0;
   for (const layer of inputLayers) {
     if (!layer.geojson?.type || layer.geojson.type !== 'FeatureCollection') {
       throw new Errors.MoleculerClientError(
@@ -172,24 +224,51 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         'EMPTY_FEATURES',
       );
     }
+    totalFeatures += layer.geojson.features.length;
+  }
+
+  // Every layer costs one GDAL process and every feature costs work inside it,
+  // so cap the total rather than only the layer count.
+  if (totalFeatures > MAX_TOTAL_FEATURES) {
+    throw new Errors.MoleculerClientError(
+      `too many features: ${totalFeatures} (max ${MAX_TOTAL_FEATURES})`,
+      400,
+      'TOO_MANY_FEATURES',
+    );
   }
 
   // Reject duplicate layer names early — ogr2ogr would overwrite silently
-  // and the user would lose data without an obvious clue.
+  // and the user would lose data without an obvious clue. Compare
+  // case-insensitively: GPKG layer names become SQLite table names, and
+  // SQLite identifiers are case-insensitive, so ["roads", "Roads"] would pass
+  // a case-sensitive check and then silently merge via -nln + -update -append.
   const seen = new Set<string>();
   for (const l of inputLayers) {
-    if (seen.has(l.name)) {
+    const key = l.name.toLowerCase();
+    if (seen.has(key)) {
       throw new Errors.MoleculerClientError(
         `duplicate layer name: "${l.name}"`,
         400,
         'DUPLICATE_LAYER',
       );
     }
-    seen.add(l.name);
+    seen.add(key);
   }
+
+  return inputLayers;
+}
+
+export async function runVectorExport(input: VectorExportInput): Promise<VectorExportResult> {
+  const { srid, name, format, logger } = input;
+
+  const inputLayers = resolveVectorExportLayers(input);
 
   const workDir = await fsp.mkdtemp(join(tmpdir(), `${format.extension}-`));
   const targetPath = join(workDir, `${name}.${format.extension}`);
+
+  // One budget for the whole export, so N layers cannot each spend the full
+  // per-process timeout and turn a bounded fan-out into an unbounded runtime.
+  const deadline = Date.now() + VECTOR_EXPORT_TIMEOUT_MS;
 
   try {
     // First layer: create the dataset. Subsequent layers: -update -append
@@ -216,7 +295,7 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         targetPath,
         ogrInputPath,
       ];
-      await run('ogr2ogr', ogrArgs);
+      await run('ogr2ogr', ogrArgs, { deadline, logger });
     }
 
     let outPath = targetPath;
@@ -226,7 +305,11 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       // "<name>.<ext>/..." (the conventional layout ArcGIS / QGIS expect).
       outPath = join(workDir, `${name}.zip`);
       filename = `${name}.zip`;
-      await run('zip', ['-rq', outPath, `${name}.${format.extension}`], workDir);
+      await run('zip', ['-rq', outPath, `${name}.${format.extension}`], {
+        cwd: workDir,
+        deadline,
+        logger,
+      });
     }
 
     const stat = await fsp.stat(outPath);
@@ -235,8 +318,26 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     // Stream ends -> safe to remove the workDir. Errors on the stream
     // bubble up via the response; cleanup still happens.
     const cleanup = () => fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
-    stream.on('close', cleanup);
-    stream.on('error', cleanup);
+
+    // Safety net. moleculer-web pipes this stream into the response without
+    // destroying it when the client disconnects, so an aborted download
+    // unpipes (pausing the source) without ever emitting 'close' or 'error' —
+    // and the temp dir plus its fd would leak for the life of the process.
+    // Repeat that and /tmp fills up. Destroy and sweep once the export's own
+    // budget is spent.
+    const sweep = setTimeout(() => {
+      logger?.error('vector export stream abandoned, sweeping temp dir', { workDir });
+      stream.destroy();
+      cleanup();
+    }, VECTOR_EXPORT_TIMEOUT_MS);
+    sweep.unref();
+
+    const finish = () => {
+      clearTimeout(sweep);
+      cleanup();
+    };
+    stream.on('close', finish);
+    stream.on('error', finish);
 
     return { stream, size: stat.size, filename, contentType: format.contentType };
   } catch (e) {
@@ -292,23 +393,64 @@ function escapeXml(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
-function run(command: string, args: string[], cwd?: string) {
+interface RunOptions {
+  cwd?: string;
+  // Absolute epoch ms by which the whole export must be done. The child gets
+  // whatever is left of it, capped at SUBPROCESS_TIMEOUT_MS.
+  deadline: number;
+  logger?: VectorExportLogger;
+}
+
+function run(command: string, args: string[], { cwd, deadline, logger }: RunOptions) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    return Promise.reject(
+      new Errors.MoleculerError('export exceeded its time budget', 504, 'EXPORT_TIMEOUT'),
+    );
+  }
+
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      // Without these the child outlives any broker timeout — the request is
+      // abandoned but GDAL keeps burning CPU until it finishes on its own.
+      timeout: Math.min(remaining, SUBPROCESS_TIMEOUT_MS),
+      killSignal: 'SIGKILL',
     });
-    const stderrChunks: string[] = [];
+
+    // Bounded buffer: keep the head of stderr (where the actionable error is)
+    // and drop the rest rather than growing with feature count.
+    let stderr = '';
     child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
+    child.stderr.on('data', (chunk: string) => {
+      if (stderr.length < MAX_STDERR_CHARS) {
+        stderr += chunk.slice(0, MAX_STDERR_CHARS - stderr.length);
+      }
+    });
+
     child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (code === 0) return resolve();
-      const stderr = stderrChunks.join('');
+
+      // stderr carries absolute temp paths, GDAL/PROJ versions and sometimes
+      // fragments of the submitted data. moleculer-web's reformatError copies
+      // both `message` and `data` straight into the response body, so neither
+      // may carry it — it goes to the server log only.
+      logger?.error(`${command} failed`, { command, args, code, signal, stderr });
+
+      // spawn's `timeout` kills with killSignal, so a null exit code plus our
+      // signal means we ran out of budget rather than hitting a data error.
+      if (signal === 'SIGKILL') {
+        return reject(
+          new Errors.MoleculerError(`${command} exceeded its time budget`, 504, 'EXPORT_TIMEOUT'),
+        );
+      }
+
       reject(
         new Errors.MoleculerError(
-          `${command} exited with code ${code}: ${stderr || '<no stderr>'}`,
+          `${command} failed to produce the export`,
           500,
           `${command.toUpperCase()}_FAILED`,
         ),
