@@ -31,9 +31,16 @@ export interface VectorExportField {
   type?: string;
 }
 
+// Only the two members the pipeline reads; the body is validated at runtime
+// and written out verbatim.
+export interface VectorExportFeatureCollection {
+  type?: string;
+  features?: unknown[];
+}
+
 export interface VectorExportLayer {
   name: string;
-  geojson: any;
+  geojson: VectorExportFeatureCollection;
   fields?: VectorExportField[];
 }
 
@@ -165,11 +172,11 @@ export const vectorExportParams = {
 // Just the slice of moleculer's LoggerInstance this module needs, so the util
 // stays decoupled from the service that owns the logger.
 export interface VectorExportLogger {
-  error: (...args: any[]) => void;
+  error: (...args: unknown[]) => void;
 }
 
 export interface VectorExportInput {
-  geojson?: any;
+  geojson?: VectorExportFeatureCollection;
   layers?: VectorExportLayer[];
   srid: number;
   name: string;

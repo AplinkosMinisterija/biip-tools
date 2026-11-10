@@ -5,6 +5,7 @@ import { Action, Service } from 'moleculer-decorators';
 import {
   GPKG_FORMAT,
   VECTOR_EXPORT_TIMEOUT_MS,
+  VectorExportFeatureCollection,
   runVectorExport,
   VectorExportLayer,
   vectorExportParams,
@@ -35,7 +36,7 @@ export default class GpkgService extends moleculer.Service {
   async create(
     ctx: Context<
       {
-        geojson?: any;
+        geojson?: VectorExportFeatureCollection;
         layers?: VectorExportLayer[];
         srid: number;
         name: string;
@@ -43,7 +44,7 @@ export default class GpkgService extends moleculer.Service {
       {
         $responseType: string;
         $statusCode: number;
-        $responseHeaders: any;
+        $responseHeaders: Record<string, string>;
       }
     >,
   ) {

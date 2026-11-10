@@ -1,3 +1,4 @@
+import { Errors } from 'moleculer';
 import { execFileSync } from 'child_process';
 import { createWriteStream, promises as fsp } from 'fs';
 import { tmpdir } from 'os';
@@ -38,8 +39,8 @@ const manyLayers = (count: number, featureCount = 1): VectorExportLayer[] => {
 const codeOf = (fn: () => unknown): string | undefined => {
   try {
     fn();
-  } catch (e: any) {
-    return e.type;
+  } catch (e) {
+    return (e as Errors.MoleculerError).type;
   }
   return undefined;
 };
