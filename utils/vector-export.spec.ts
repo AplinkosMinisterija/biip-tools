@@ -1,7 +1,16 @@
+import { execFileSync } from 'child_process';
+import { createWriteStream, promises as fsp } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { pipeline } from 'stream/promises';
 import {
+  GPKG_FORMAT,
   MAX_LAYERS,
   MAX_TOTAL_FEATURES,
   resolveVectorExportLayers,
+  runVectorExport,
+  SHP_FORMAT,
+  VectorExportFormat,
   VectorExportLayer,
 } from './vector-export';
 
@@ -75,9 +84,9 @@ describe('resolveVectorExportLayers', () => {
     });
 
     it('rejects a layer with no features', () => {
-      expect(codeOf(() => resolveVectorExportLayers({ layers: [layer('places', 0)], name: 'x' }))).toBe(
-        'EMPTY_FEATURES',
-      );
+      expect(
+        codeOf(() => resolveVectorExportLayers({ layers: [layer('places', 0)], name: 'x' })),
+      ).toBe('EMPTY_FEATURES');
     });
   });
 
@@ -136,5 +145,143 @@ describe('resolveVectorExportLayers', () => {
       const layers = [layer('roads'), layer('roads_2')];
       expect(resolveVectorExportLayers({ layers, name: 'extract' })).toHaveLength(2);
     });
+  });
+});
+
+const hasOgr = (() => {
+  try {
+    execFileSync('ogr2ogr', ['--version'], { stdio: 'ignore' });
+    execFileSync('zip', ['-h'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+// The pipeline shells out to GDAL; the guardrail tests above must still run on
+// a machine without it.
+const describeIfOgr = hasOgr ? describe : describe.skip;
+
+const polygonFC = {
+  type: 'FeatureCollection',
+  features: [
+    {
+      type: 'Feature',
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: [
+          [
+            [
+              [500000, 6000000],
+              [500010, 6000000],
+              [500010, 6000010],
+              [500000, 6000000],
+            ],
+          ],
+        ],
+      },
+      properties: { placeId: 12, placeCode: 'SRIS-12', placeCreatedAt: '2024-03-01' },
+    },
+  ],
+};
+
+const pointFC = {
+  type: 'FeatureCollection',
+  features: [
+    {
+      type: 'Feature',
+      geometry: { type: 'MultiPoint', coordinates: [[500005, 6000005]] },
+      properties: { formId: 77, observedAt: '2024-04-02' },
+    },
+  ],
+};
+
+const twoLayers: VectorExportLayer[] = [
+  {
+    name: 'Radavietes',
+    geojson: polygonFC,
+    fields: [
+      { name: 'placeId', shortName: 'RADAV_ID', type: 'Integer', alias: 'Radavietės ID' },
+      { name: 'placeCode', shortName: 'RADAV_KOD', type: 'String', alias: 'Radavietės kodas' },
+      { name: 'placeCreatedAt', shortName: 'SUKURTA', type: 'Date', alias: 'Sukūrimo data' },
+    ],
+  },
+  {
+    name: 'Stebejimai',
+    geojson: pointFC,
+    fields: [
+      { name: 'formId', shortName: 'ANKET_ID', type: 'Integer', alias: 'Anketos ID' },
+      { name: 'observedAt', shortName: 'STEB_DATA', type: 'Date', alias: 'Stebėta' },
+    ],
+  },
+];
+
+const exportTo = async (format: VectorExportFormat, dir: string) => {
+  const { stream, filename, size, contentType } = await runVectorExport({
+    layers: twoLayers,
+    name: 'israsas-1',
+    srid: 3346,
+    format,
+  });
+
+  const target = join(dir, filename);
+  await pipeline(stream, createWriteStream(target));
+
+  return { target, filename, size, contentType };
+};
+
+const fieldNamesOf = (dataset: string, layer: string) =>
+  execFileSync('ogrinfo', ['-so', dataset, layer], { encoding: 'utf8' })
+    .split('\n')
+    .map((line) => line.match(/^(\w+): (String|Integer|Integer64|Real|Date|DateTime)/)?.[1])
+    .filter((name): name is string => !!name);
+
+describeIfOgr('runVectorExport', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fsp.mkdtemp(join(tmpdir(), 'vector-export-spec-'));
+  });
+
+  afterEach(async () => {
+    await fsp.rm(dir, { recursive: true, force: true });
+  });
+
+  it('packages one shapefile per layer into a zip named after the export', async () => {
+    const { target, filename, size, contentType } = await exportTo(SHP_FORMAT, dir);
+
+    expect(filename).toBe('israsas-1.zip');
+    expect(contentType).toBe('application/zip');
+    expect(size).toBeGreaterThan(0);
+
+    const entries = execFileSync('unzip', ['-Z1', target], { encoding: 'utf8' }).split('\n');
+    expect(entries).toContain('israsas-1/Radavietes.shp');
+    expect(entries).toContain('israsas-1/Stebejimai.shp');
+    expect(entries).toContain('israsas-1/Radavietes.dbf');
+    expect(entries).toContain('israsas-1/Radavietes.prj');
+  });
+
+  it('renames shapefile fields to their shortName — DBF caps a name at 10 characters', async () => {
+    const { target } = await exportTo(SHP_FORMAT, dir);
+    execFileSync('unzip', ['-q', target, '-d', dir]);
+
+    expect(fieldNamesOf(join(dir, 'israsas-1', 'Radavietes.shp'), 'Radavietes')).toEqual([
+      'RADAV_ID',
+      'RADAV_KOD',
+      'SUKURTA',
+    ]);
+    expect(fieldNamesOf(join(dir, 'israsas-1', 'Stebejimai.shp'), 'Stebejimai')).toEqual([
+      'ANKET_ID',
+      'STEB_DATA',
+    ]);
+  });
+
+  it('keeps the full field names in a geopackage holding every layer', async () => {
+    const { target, filename, contentType } = await exportTo(GPKG_FORMAT, dir);
+
+    expect(filename).toBe('israsas-1.gpkg');
+    expect(contentType).toBe('application/geopackage+sqlite3');
+    expect(fieldNamesOf(target, 'Radavietes')).toEqual(['placeId', 'placeCode', 'placeCreatedAt']);
+    expect(fieldNamesOf(target, 'Stebejimai')).toEqual(['formId', 'observedAt']);
   });
 });

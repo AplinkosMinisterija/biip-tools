@@ -30,8 +30,8 @@ export default class GpkgService extends moleculer.Service {
     },
     params: vectorExportParams,
     rest: ['POST /'],
-    // Bound the request the same way the pipeline bounds itself; the
-    // previous `timeout: 0` meant an export could never be abandoned.
+    // Same budget the pipeline enforces, so a stuck export is abandoned
+    // instead of held open forever.
     timeout: VECTOR_EXPORT_TIMEOUT_MS,
   })
   async create(

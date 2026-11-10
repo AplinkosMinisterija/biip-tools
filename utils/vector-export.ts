@@ -32,6 +32,8 @@ const MAX_STDERR_CHARS = 64 * 1024;
 
 export interface VectorExportField {
   name: string;
+  // Name to use where the driver caps field names (Shapefile: 10 chars).
+  shortName?: string;
   alias?: string;
   type?: string;
 }
@@ -43,19 +45,27 @@ export interface VectorExportLayer {
 }
 
 // How a target format maps onto the shared ogr2ogr pipeline. `packaging`
-// exists because OpenFileGDB produces a directory (which must be zipped to
-// travel over HTTP) while GPKG is a single SQLite file served as-is.
+// exists because OpenFileGDB and Shapefile produce a directory (which must be
+// zipped to travel over HTTP) while GPKG is a single SQLite file served as-is.
+// `layout` splits the two directory formats apart: a .gdb is one dataset that
+// holds every layer, a Shapefile directory is one file set per layer.
 export interface VectorExportFormat {
-  ogrDriver: 'OpenFileGDB' | 'GPKG';
-  extension: 'gdb' | 'gpkg';
+  ogrDriver: 'OpenFileGDB' | 'GPKG' | 'ESRI Shapefile';
+  extension: 'gdb' | 'gpkg' | 'shp';
   packaging: 'zip' | 'raw';
+  layout: 'dataset' | 'layer-files';
   contentType: string;
+  // The DBF header has no room for an alias and caps a field name at 10
+  // characters, so Shapefile exports use the caller's shortName instead.
+  shortFieldNames?: boolean;
+  layerCreationOptions?: string[];
 }
 
 export const GDB_FORMAT: VectorExportFormat = {
   ogrDriver: 'OpenFileGDB',
   extension: 'gdb',
   packaging: 'zip',
+  layout: 'dataset',
   contentType: 'application/zip',
 };
 
@@ -63,7 +73,20 @@ export const GPKG_FORMAT: VectorExportFormat = {
   ogrDriver: 'GPKG',
   extension: 'gpkg',
   packaging: 'raw',
+  layout: 'dataset',
   contentType: 'application/geopackage+sqlite3',
+};
+
+export const SHP_FORMAT: VectorExportFormat = {
+  ogrDriver: 'ESRI Shapefile',
+  extension: 'shp',
+  packaging: 'zip',
+  layout: 'layer-files',
+  contentType: 'application/zip',
+  shortFieldNames: true,
+  // Without this the .dbf is written as ISO-8859-1 and every Lithuanian
+  // character in a value arrives mangled.
+  layerCreationOptions: ['ENCODING=UTF-8'],
 };
 
 // Shared fastest-validator schema for the /gdb and /gpkg actions. The two
@@ -115,6 +138,7 @@ export const vectorExportParams = {
             type: 'object',
             props: {
               name: 'string',
+              shortName: { type: 'string', optional: true, max: 10 },
               alias: { type: 'string', optional: true },
               type: {
                 type: 'enum',
@@ -264,15 +288,21 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
   const inputLayers = resolveVectorExportLayers(input);
 
   const workDir = await fsp.mkdtemp(join(tmpdir(), `${format.extension}-`));
-  const targetPath = join(workDir, `${name}.${format.extension}`);
+  // A Shapefile export is a directory of file sets named after the layers, so
+  // its root carries no extension; the other two drivers take one dataset path.
+  const isLayerFiles = format.layout === 'layer-files';
+  const targetName = isLayerFiles ? name : `${name}.${format.extension}`;
+  const targetPath = join(workDir, targetName);
 
   // One budget for the whole export, so N layers cannot each spend the full
   // per-process timeout and turn a bounded fan-out into an unbounded runtime.
   const deadline = Date.now() + VECTOR_EXPORT_TIMEOUT_MS;
 
   try {
-    // First layer: create the dataset. Subsequent layers: -update -append
-    // so each one becomes its own table inside the same dataset.
+    if (isLayerFiles) await fsp.mkdir(targetPath);
+
+    // One dataset: the first layer creates it, the rest are appended as their
+    // own tables. Layer files: every layer is its own independent write.
     // If a layer declares `fields`, wrap its GeoJSON in an OGR VRT XML
     // first so the result carries the declared types + alias names;
     // without VRT, ogr2ogr infers everything as String and the attribute
@@ -282,7 +312,9 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       const layerGeojsonPath = join(workDir, `${layer.name}.geojson`);
       await fsp.writeFile(layerGeojsonPath, JSON.stringify(layer.geojson));
 
-      const ogrInputPath = layer.fields?.length ? await writeVrt(workDir, layer) : layerGeojsonPath;
+      const ogrInputPath = layer.fields?.length
+        ? await writeVrt(workDir, layer, !!format.shortFieldNames)
+        : layerGeojsonPath;
 
       const ogrArgs = [
         '-f',
@@ -291,8 +323,9 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         `EPSG:${srid}`,
         '-nln',
         layer.name,
-        ...(i === 0 ? [] : ['-update', '-append']),
-        targetPath,
+        ...(format.layerCreationOptions || []).flatMap((option) => ['-lco', option]),
+        ...(isLayerFiles || i === 0 ? [] : ['-update', '-append']),
+        isLayerFiles ? join(targetPath, `${layer.name}.${format.extension}`) : targetPath,
         ogrInputPath,
       ];
       await run('ogr2ogr', ogrArgs, { deadline, logger });
@@ -305,7 +338,7 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       // "<name>.<ext>/..." (the conventional layout ArcGIS / QGIS expect).
       outPath = join(workDir, `${name}.zip`);
       filename = `${name}.zip`;
-      await run('zip', ['-rq', outPath, `${name}.${format.extension}`], {
+      await run('zip', ['-rq', outPath, targetName], {
         cwd: workDir,
         deadline,
         logger,
@@ -356,14 +389,20 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
 // and has nowhere to put an alias, so the resulting attribute table reads
 // like the snake_case field names with no human label and no numeric type
 // info.
-async function writeVrt(workDir: string, layer: VectorExportLayer): Promise<string> {
+async function writeVrt(
+  workDir: string,
+  layer: VectorExportLayer,
+  shortFieldNames: boolean,
+): Promise<string> {
   // GeoJSON layer name == basename of the .geojson file (without the
   // extension), so OGR can find it via the VRT's <SrcLayer>.
   const geojsonLayerName = layer.name;
   const geojsonPath = `${geojsonLayerName}.geojson`; // relative to workDir
   const fieldXml = (layer.fields ?? [])
     .map((f) => {
-      const attrs = [`name="${escapeXml(f.name)}"`];
+      const exportedName = (shortFieldNames && f.shortName) || f.name;
+      // `src` names the GeoJSON property, so a renamed field still reads it.
+      const attrs = [`name="${escapeXml(exportedName)}"`, `src="${escapeXml(f.name)}"`];
       if (f.type) attrs.push(`type="${escapeXml(f.type)}"`);
       if (f.alias) attrs.push(`alternativeName="${escapeXml(f.alias)}"`);
       return `    <Field ${attrs.join(' ')}/>`;
