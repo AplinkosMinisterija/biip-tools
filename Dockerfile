@@ -1,11 +1,9 @@
 # Stage 1: Base image
 FROM node:20-alpine as base
 
-# Required for dependencies coming from git, plus gdal-tools (ogr2ogr) for
-# the /gdb, /gpkg and /shp endpoints that convert GeoJSON to ESRI File
-# Geodatabase / OGC GeoPackage / ESRI Shapefile, and zip to package the .gdb
-# and shapefile directory trees as a single archive (.gpkg needs no packaging).
-RUN apk add --no-cache git gdal-tools zip
+# The grep fails the build if GDAL here cannot WRITE OpenFileGDB (needs >=3.6).
+RUN apk add --no-cache git gdal-tools zip \
+    && ogrinfo --formats | grep -qE '^ *OpenFileGDB .*\(rw'
 
 # Stage 2: Builder image
 FROM base as builder
