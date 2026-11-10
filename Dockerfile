@@ -2,8 +2,9 @@
 FROM node:20-alpine as base
 
 # Required for dependencies coming from git, plus gdal-tools (ogr2ogr) for
-# the /gdb endpoint that converts GeoJSON to ESRI File Geodatabase, and zip
-# to package the .gdb directory tree as a single archive.
+# the /gdb and /gpkg endpoints that convert GeoJSON to ESRI File Geodatabase
+# / OGC GeoPackage, and zip to package the .gdb directory tree as a single
+# archive (.gpkg is a single file and needs no packaging).
 RUN apk add --no-cache git gdal-tools zip
 
 # Stage 2: Builder image
