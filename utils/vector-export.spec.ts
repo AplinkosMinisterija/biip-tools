@@ -277,6 +277,23 @@ describeIfOgr('runVectorExport', () => {
     ]);
   });
 
+  it('fails when ogr2ogr reports an error on stderr but still exits 0', async () => {
+    const layers: VectorExportLayer[] = [
+      {
+        name: 'Radavietes',
+        geojson: polygonFC,
+        fields: [
+          { name: 'placeId', shortName: 'RADAV_ID', type: 'Integer', alias: 'Radavietės ID' },
+          { name: 'noSuchField', shortName: 'NEBE', type: 'String', alias: 'Nėra tokio' },
+        ],
+      },
+    ];
+
+    await expect(
+      runVectorExport({ layers, name: 'israsas-1', srid: 3346, format: GPKG_FORMAT }),
+    ).rejects.toMatchObject({ type: 'OGR2OGR_FAILED' });
+  });
+
   it('keeps the full field names in a geopackage holding every layer', async () => {
     const { target, filename, contentType } = await exportTo(GPKG_FORMAT, dir);
 

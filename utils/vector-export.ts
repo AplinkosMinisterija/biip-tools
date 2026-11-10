@@ -437,6 +437,11 @@ interface RunOptions {
   logger?: VectorExportLogger;
 }
 
+// GDAL reports a fatal data error (a VRT source field it cannot find, a field
+// it cannot create) on stderr and still exits 0, leaving an empty dataset that
+// would otherwise be packaged, uploaded and announced as a finished export.
+const SUBPROCESS_ERROR_LINE = /^ERROR \d+/m;
+
 function run(command: string, args: string[], { cwd, deadline, logger }: RunOptions) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
@@ -468,7 +473,7 @@ function run(command: string, args: string[], { cwd, deadline, logger }: RunOpti
 
     child.on('error', reject);
     child.on('close', (code, signal) => {
-      if (code === 0) return resolve();
+      if (code === 0 && !SUBPROCESS_ERROR_LINE.test(stderr)) return resolve();
 
       // stderr carries absolute temp paths, GDAL/PROJ versions and sometimes
       // fragments of the submitted data. moleculer-web's reformatError copies
