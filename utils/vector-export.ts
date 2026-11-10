@@ -20,7 +20,10 @@ export const MAX_TOTAL_FEATURES = 500_000;
 
 // Whole-pipeline budget, shared by every child process in one export. Also
 // used as the moleculer action timeout so the broker and the pipeline agree.
-export const VECTOR_EXPORT_TIMEOUT_MS = 10 * 60 * 1000;
+// Kept under undici's 300s default header deadline: a caller on node's global
+// fetch cannot wait longer, so a larger budget only trades a legible timeout
+// for an opaque "fetch failed" on the other side.
+export const VECTOR_EXPORT_TIMEOUT_MS = 4 * 60 * 1000;
 
 // Per-process ceiling, applied on top of whatever is left of the deadline.
 const SUBPROCESS_TIMEOUT_MS = 2 * 60 * 1000;
