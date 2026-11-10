@@ -31,8 +31,6 @@ export default class GdbService extends moleculer.Service {
     },
     params: vectorExportParams,
     rest: ['POST /'],
-    // Same budget the pipeline enforces, so a stuck export is abandoned
-    // instead of held open forever.
     timeout: VECTOR_EXPORT_TIMEOUT_MS,
   })
   async create(

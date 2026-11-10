@@ -6,23 +6,13 @@ import { Errors } from 'moleculer';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-// Guardrails for the shared ogr2ogr pipeline.
-//
-// These endpoints are unauthenticated (the gateway runs with
-// authentication/authorization off and whitelist ['**']), every layer costs
-// one GDAL process, and the body limit is 25MB. A minimal valid layer is
-// ~137 bytes, so without a cap one request can ask for ~180k sequential
-// ogr2ogr spawns — hours of CPU held by a single connection. Bound the fan-out
-// (layer count), the work per layer (feature count) and the wall clock
-// (deadline), so the worst case is bounded rather than merely unlikely.
+// The endpoints are unauthenticated and a ~137-byte layer costs one GDAL
+// process, so a 25MB body could ask for ~180k sequential ogr2ogr spawns.
 export const MAX_LAYERS = 32;
 export const MAX_TOTAL_FEATURES = 500_000;
 
-// Whole-pipeline budget, shared by every child process in one export. Also
-// used as the moleculer action timeout so the broker and the pipeline agree.
-// Kept under undici's 300s default header deadline: a caller on node's global
-// fetch cannot wait longer, so a larger budget only trades a legible timeout
-// for an opaque "fetch failed" on the other side.
+// Under undici's 300s header deadline: a caller on node's global fetch cannot
+// wait longer, so a bigger budget only buys an opaque "fetch failed".
 export const VECTOR_EXPORT_TIMEOUT_MS = 4 * 60 * 1000;
 
 // Per-process ceiling, applied on top of whatever is left of the deadline.
@@ -47,11 +37,8 @@ export interface VectorExportLayer {
   fields?: VectorExportField[];
 }
 
-// How a target format maps onto the shared ogr2ogr pipeline. `packaging`
-// exists because OpenFileGDB and Shapefile produce a directory (which must be
-// zipped to travel over HTTP) while GPKG is a single SQLite file served as-is.
-// `layout` splits the two directory formats apart: a .gdb is one dataset that
-// holds every layer, a Shapefile directory is one file set per layer.
+// `packaging`: GDB and Shapefile produce a directory to zip, GPKG one file.
+// `layout`: a .gdb holds every layer, a Shapefile directory one set per layer.
 export interface VectorExportFormat {
   ogrDriver: 'OpenFileGDB' | 'GPKG' | 'ESRI Shapefile';
   extension: 'gdb' | 'gpkg' | 'shp';
