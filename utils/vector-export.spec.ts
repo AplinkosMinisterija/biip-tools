@@ -480,6 +480,7 @@ describeIfOgr('runVectorExport', () => {
     afterEach(async () => {
       delete process.env.VECTOR_EXPORT_SOURCE_HOSTS;
       delete process.env.VECTOR_EXPORT_MAX_SOURCE_BYTES;
+      delete process.env.VECTOR_EXPORT_SOURCE_IDLE_MS;
       await new Promise((resolve) => server.close(resolve));
     });
 
@@ -521,6 +522,37 @@ describeIfOgr('runVectorExport', () => {
 
       expect(fieldNamesOf(fromUrl, 'Radavietes')).toEqual(fieldNamesOf(inline, 'Radavietes'));
       expect(featureCountOf(fromUrl, 'Radavietes')).toBe(featureCountOf(inline, 'Radavietes'));
+    });
+
+    it('gives up on a source that accepts the connection and never answers', async () => {
+      process.env.VECTOR_EXPORT_SOURCE_IDLE_MS = '150';
+      await new Promise((resolve) => server.close(resolve));
+      // Accepts the socket and holds it: without an idle timeout the export never settles.
+      server = createServer(() => undefined);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      origin = `http://127.0.0.1:${port}`;
+      process.env.VECTOR_EXPORT_SOURCE_HOSTS = `127.0.0.1:${port}`;
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
+        type: 'SOURCE_FETCH_FAILED',
+      });
+    });
+
+    it('gives up on a source that answers and then stalls mid-body', async () => {
+      process.env.VECTOR_EXPORT_SOURCE_IDLE_MS = '150';
+      await new Promise((resolve) => server.close(resolve));
+      // Headers, one chunk, then silence - the shape a stalled proxy actually has.
+      server = createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/geo+json', 'Content-Length': '999999' });
+        res.write('{"type":"FeatureCollection","features":[');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      origin = `http://127.0.0.1:${port}`;
+      process.env.VECTOR_EXPORT_SOURCE_HOSTS = `127.0.0.1:${port}`;
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toBeDefined();
     });
 
     it('refuses a source that names a gdal command line of its own', async () => {

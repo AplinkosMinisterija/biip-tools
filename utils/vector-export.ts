@@ -19,6 +19,8 @@ export const MAX_TOTAL_FEATURES = 500_000;
 
 // The `type` member has to fall inside this window, which the writer on the other side puts first.
 const SOURCE_HEAD_BYTES = 512;
+// Idle, not total: a legitimately slow download must not be cut, but a socket that stops moving bytes has to let go.
+const DEFAULT_SOURCE_IDLE_MS = 2 * 60 * 1000;
 // A url layer is never parsed, so bytes on disk are the only countable limit.
 const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 
@@ -488,6 +490,10 @@ interface SourceBudget {
   remaining: number;
 }
 
+function sourceIdleMs(): number {
+  return Number(process.env.VECTOR_EXPORT_SOURCE_IDLE_MS) || DEFAULT_SOURCE_IDLE_MS;
+}
+
 function openSource(url: string): Promise<IncomingMessage> {
   const get = url.startsWith('https:') ? httpsGet : httpGet;
 
@@ -498,7 +504,7 @@ function openSource(url: string): Promise<IncomingMessage> {
         new Errors.MoleculerError(`source fetch failed: ${detail}`, 502, 'SOURCE_FETCH_FAILED'),
       );
 
-    get(url, (response) => {
+    const request = get(url, (response) => {
       const status = response.statusCode || 0;
       if (status < 200 || status > 299) {
         response.resume();
@@ -506,6 +512,9 @@ function openSource(url: string): Promise<IncomingMessage> {
       }
       resolve(response);
     }).on('error', (e: NodeJS.ErrnoException) => fail(e.code || e.message));
+
+    // The socket outlives the headers, so this also covers a body that stalls mid-download.
+    request.setTimeout(sourceIdleMs(), () => request.destroy(new Error('ETIMEDOUT')));
   });
 }
 
