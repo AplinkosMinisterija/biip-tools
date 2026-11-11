@@ -15,6 +15,9 @@ import {
   resolveVectorExportLayers,
   runVectorExport,
   SHP_FORMAT,
+  sweepAbandonedStream,
+  VECTOR_EXPORT_STREAM_MAX_MS,
+  VECTOR_EXPORT_TIMEOUT_MS,
   VectorExportFormat,
   VectorExportLayer,
 } from './vector-export';
@@ -383,5 +386,46 @@ describeIfOgr('runVectorExport', () => {
     expect(contentType).toBe('application/geopackage+sqlite3');
     expect(fieldNamesOf(target, 'Radavietes')).toEqual(['placeId', 'placeCode', 'placeCreatedAt']);
     expect(fieldNamesOf(target, 'Stebejimai')).toEqual(['formId', 'observedAt']);
+  });
+});
+
+describe('sweepAbandonedStream', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it('leaves a stream that keeps reading alone', () => {
+    const stream = { bytesRead: 0 };
+    const onAbandoned = jest.fn();
+    sweepAbandonedStream(stream, onAbandoned);
+
+    for (let i = 0; i < 3; i++) {
+      stream.bytesRead += 64 * 1024;
+      jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+    }
+
+    expect(onAbandoned).not.toHaveBeenCalled();
+  });
+
+  it('sweeps a stream that stopped reading', () => {
+    const onAbandoned = jest.fn();
+    sweepAbandonedStream({ bytesRead: 0 }, onAbandoned);
+
+    jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+
+    expect(onAbandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it('sweeps a stream that trickles past the absolute deadline', () => {
+    const stream = { bytesRead: 0 };
+    const onAbandoned = jest.fn();
+    sweepAbandonedStream(stream, onAbandoned);
+
+    const start = Date.now();
+    while (Date.now() - start <= VECTOR_EXPORT_STREAM_MAX_MS) {
+      stream.bytesRead += 1;
+      jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+    }
+
+    expect(onAbandoned).toHaveBeenCalledTimes(1);
   });
 });

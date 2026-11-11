@@ -17,6 +17,9 @@ export const MAX_TOTAL_FEATURES = 500_000;
 // wait longer, so a bigger budget only buys an opaque "fetch failed".
 export const VECTOR_EXPORT_TIMEOUT_MS = 4 * 60 * 1000;
 
+// A trickling client keeps the progress check happy forever, so the download gets a ceiling of its own.
+export const VECTOR_EXPORT_STREAM_MAX_MS = 4 * VECTOR_EXPORT_TIMEOUT_MS;
+
 // Per-process ceiling, applied on top of whatever is left of the deadline.
 const SUBPROCESS_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -295,6 +298,25 @@ export function resolveVectorExportLayers(
   return inputLayers;
 }
 
+// Progress, not wall clock: a plain timer cut a slow client's download at the budget.
+export function sweepAbandonedStream(
+  stream: { bytesRead: number },
+  onAbandoned: () => void,
+): NodeJS.Timeout {
+  const hardDeadline = Date.now() + VECTOR_EXPORT_STREAM_MAX_MS;
+  let lastBytesRead = 0;
+  const sweep = setInterval(() => {
+    const stalled = stream.bytesRead === lastBytesRead;
+    lastBytesRead = stream.bytesRead;
+    if (!stalled && Date.now() < hardDeadline) return;
+
+    clearInterval(sweep);
+    onAbandoned();
+  }, VECTOR_EXPORT_TIMEOUT_MS);
+  sweep.unref();
+  return sweep;
+}
+
 export async function runVectorExport(input: VectorExportInput): Promise<VectorExportResult> {
   const { srid, name, format, logger } = input;
 
@@ -386,20 +408,11 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     // and the temp dir plus its fd would leak for the life of the process.
     // Repeat that and /tmp fills up. Destroy and sweep once the export's own
     // budget is spent.
-    // Progress, not wall clock: a plain timer cut a slow client's download at the budget.
-    let lastBytesRead = 0;
-    const sweep = setInterval(() => {
-      if (stream.bytesRead !== lastBytesRead) {
-        lastBytesRead = stream.bytesRead;
-        return;
-      }
-
+    const sweep = sweepAbandonedStream(stream, () => {
       logger?.error('vector export stream abandoned, sweeping temp dir', { workDir });
-      clearInterval(sweep);
       stream.destroy();
       cleanup();
-    }, VECTOR_EXPORT_TIMEOUT_MS);
-    sweep.unref();
+    });
 
     const finish = () => {
       clearInterval(sweep);
