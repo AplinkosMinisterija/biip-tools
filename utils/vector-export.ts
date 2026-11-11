@@ -1,10 +1,14 @@
 'use strict';
 
 import { spawn } from 'child_process';
-import { createReadStream, promises as fsp } from 'fs';
+import { createReadStream, createWriteStream, promises as fsp } from 'fs';
+import { get as httpGet, IncomingMessage } from 'http';
+import { get as httpsGet } from 'https';
 import { Errors } from 'moleculer';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 
 // The endpoints are unauthenticated and a ~137-byte layer costs one GDAL
 // process, so a 25MB body could ask for ~180k sequential ogr2ogr spawns.
@@ -12,6 +16,21 @@ export const MAX_LAYERS = 32;
 // One VRT column per field, and the DBF/GDB ceiling is 255 anyway.
 export const MAX_FIELDS = 255;
 export const MAX_TOTAL_FEATURES = 500_000;
+
+// A url layer is never parsed, so bytes on disk are the only countable limit.
+const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
+
+function maxSourceBytes(): number {
+  return Number(process.env.VECTOR_EXPORT_MAX_SOURCE_BYTES) || DEFAULT_MAX_SOURCE_BYTES;
+}
+
+// Fail closed: an unconfigured deployment fetches nothing and stays inline-only.
+function allowedSourceHosts(): string[] {
+  return (process.env.VECTOR_EXPORT_SOURCE_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+}
 
 // These bound an abandoned DOWNLOAD; a conversion of real size is never cut short.
 export const DOWNLOAD_IDLE_SWEEP_MS = 4 * 60 * 1000;
@@ -40,7 +59,9 @@ export interface VectorExportFeatureCollection {
 
 export interface VectorExportLayer {
   name: string;
-  geojson: VectorExportFeatureCollection;
+  // Exactly one of the two: an inline collection, or a url to fetch it from.
+  geojson?: VectorExportFeatureCollection;
+  url?: string;
   fields?: VectorExportField[];
 }
 
@@ -125,7 +146,12 @@ export const vectorExportParams = {
           // we can't use \p{L}; diacritics are spelled out instead.
           pattern: '^[A-Za-zĄČĘĖĮŠŲŪŽąčęėįšųūž_][A-Za-z0-9ĄČĘĖĮŠŲŪŽąčęėįšųūž_]{0,63}$',
         },
-        geojson: 'object',
+        geojson: { type: 'object', optional: true },
+        url: {
+          type: 'url',
+          optional: true,
+          $$t: 'Fetch the layer GeoJSON from here instead of sending it inline. The host must be allowlisted server-side.',
+        },
         // Optional per-field alias / type overrides. When provided, the
         // layer is fed through an OGR VRT wrapper so the exported dataset
         // carries the alternative names (what QGIS / ArcGIS surface in
@@ -245,6 +271,28 @@ export function resolveVectorExportLayers(
 
   let totalFeatures = 0;
   for (const layer of inputLayers) {
+    if (layer.url) {
+      if (layer.geojson) {
+        throw new Errors.MoleculerClientError(
+          `layer "${layer.name}": pass either \`geojson\` or \`url\`, not both`,
+          400,
+          'LAYER_INPUT_AMBIGUOUS',
+        );
+      }
+
+      const host = new URL(layer.url).host.toLowerCase();
+      if (!allowedSourceHosts().includes(host)) {
+        // The host, never the url: a rejected url can carry a signature.
+        throw new Errors.MoleculerClientError(
+          `layer "${layer.name}": source host "${host}" is not allowed`,
+          400,
+          'URL_HOST_NOT_ALLOWED',
+        );
+      }
+
+      continue;
+    }
+
     if (!layer.geojson?.type || layer.geojson.type !== 'FeatureCollection') {
       throw new Errors.MoleculerClientError(
         `layer "${layer.name}": geojson must be a FeatureCollection`,
@@ -324,6 +372,8 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
   const targetName = isLayerFiles ? name : `${name}.${format.extension}`;
   const targetPath = join(workDir, targetName);
 
+  const budget: SourceBudget = { remaining: maxSourceBytes() };
+
   try {
     if (isLayerFiles) await fsp.mkdir(targetPath);
 
@@ -336,11 +386,15 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     for (let i = 0; i < inputLayers.length; i++) {
       const layer = inputLayers[i];
       const layerGeojsonPath = join(workDir, `${layer.name}.geojson`);
-      // Only what the layer is: GDAL names the source layer after a root `name` member, which the VRT's SrcLayer would then miss.
-      await fsp.writeFile(
-        layerGeojsonPath,
-        JSON.stringify({ type: 'FeatureCollection', features: layer.geojson.features || [] }),
-      );
+      if (layer.url) {
+        await fetchSource(layer.url, layerGeojsonPath, budget);
+      } else {
+        // Only what the layer is: GDAL names the source layer after a root `name` member, which the VRT's SrcLayer would then miss.
+        await fsp.writeFile(
+          layerGeojsonPath,
+          JSON.stringify({ type: 'FeatureCollection', features: layer.geojson?.features || [] }),
+        );
+      }
 
       const ogrInputPath = layer.fields?.length
         ? await writeVrt(workDir, layer, !!format.shortFieldNames)
@@ -425,6 +479,54 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
 // and has nowhere to put an alias, so the resulting attribute table reads
 // like the snake_case field names with no human label and no numeric type
 // info.
+// One byte budget for the whole export, so N layers cannot each spend the cap.
+interface SourceBudget {
+  remaining: number;
+}
+
+function openSource(url: string): Promise<IncomingMessage> {
+  const get = url.startsWith('https:') ? httpsGet : httpGet;
+
+  return new Promise<IncomingMessage>((resolve, reject) => {
+    const fail = (detail: string) =>
+      // Status or syscall only: the body of a refused fetch carries the store's own detail.
+      reject(
+        new Errors.MoleculerError(`source fetch failed: ${detail}`, 502, 'SOURCE_FETCH_FAILED'),
+      );
+
+    get(url, (response) => {
+      const status = response.statusCode || 0;
+      if (status < 200 || status > 299) {
+        response.resume();
+        return fail(`HTTP ${status}`);
+      }
+      resolve(response);
+    }).on('error', (e: NodeJS.ErrnoException) => fail(e.code || e.message));
+  });
+}
+
+async function fetchSource(url: string, path: string, budget: SourceBudget): Promise<void> {
+  const response = await openSource(url);
+
+  const counted = new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      budget.remaining -= chunk.length;
+      if (budget.remaining < 0) {
+        return done(
+          new Errors.MoleculerError(
+            `source exceeds the ${maxSourceBytes()} byte budget`,
+            413,
+            'SOURCE_TOO_LARGE',
+          ),
+        );
+      }
+      done(null, chunk);
+    },
+  });
+
+  await pipeline(response, counted, createWriteStream(path));
+}
+
 async function writeVrt(
   workDir: string,
   layer: VectorExportLayer,

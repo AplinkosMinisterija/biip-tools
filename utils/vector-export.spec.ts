@@ -4,6 +4,8 @@ import { execFileSync } from 'child_process';
 import { createWriteStream, promises as fsp } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { createServer, Server } from 'http';
+import { AddressInfo } from 'net';
 import { pipeline } from 'stream/promises';
 import {
   VectorExportFeatureCollection,
@@ -184,6 +186,75 @@ describe('resolveVectorExportLayers', () => {
     });
   });
 
+  describe('url layers', () => {
+    const SOURCE = 'https://s3.example.lt/tmp/Upes.geojson';
+
+    beforeEach(() => {
+      process.env.VECTOR_EXPORT_SOURCE_HOSTS = 's3.example.lt';
+    });
+    afterEach(() => {
+      delete process.env.VECTOR_EXPORT_SOURCE_HOSTS;
+    });
+
+    it('accepts a layer given as a url', () => {
+      const layers = resolveVectorExportLayers({
+        layers: [{ name: 'Upes', url: SOURCE }],
+        name: 'israsas-1',
+      });
+
+      expect(layers).toEqual([{ name: 'Upes', url: SOURCE }]);
+    });
+
+    it('rejects a layer that carries both geojson and url', () => {
+      expect(() =>
+        resolveVectorExportLayers({
+          layers: [{ name: 'Upes', geojson: polygonFC, url: SOURCE }],
+          name: 'israsas-1',
+        }),
+      ).toThrow(expect.objectContaining({ type: 'LAYER_INPUT_AMBIGUOUS' }));
+    });
+
+    it('rejects a layer with neither geojson nor url', () => {
+      expect(() =>
+        resolveVectorExportLayers({ layers: [{ name: 'Upes' }], name: 'israsas-1' }),
+      ).toThrow(expect.objectContaining({ type: 'INVALID_GEOJSON' }));
+    });
+
+    it('rejects a url whose host is not allowlisted', () => {
+      expect(() =>
+        resolveVectorExportLayers({
+          layers: [{ name: 'Upes', url: 'https://evil.example/a.geojson' }],
+          name: 'israsas-1',
+        }),
+      ).toThrow(expect.objectContaining({ type: 'URL_HOST_NOT_ALLOWED' }));
+    });
+
+    it('rejects every url when no allowlist is configured', () => {
+      delete process.env.VECTOR_EXPORT_SOURCE_HOSTS;
+
+      expect(() =>
+        resolveVectorExportLayers({ layers: [{ name: 'Upes', url: SOURCE }], name: 'israsas-1' }),
+      ).toThrow(expect.objectContaining({ type: 'URL_HOST_NOT_ALLOWED' }));
+    });
+
+    it('counts the features of inline layers only', () => {
+      const inline = {
+        name: 'Stebejimai',
+        geojson: {
+          type: 'FeatureCollection',
+          features: new Array(MAX_TOTAL_FEATURES).fill(polygonFC.features[0]),
+        } as VectorExportFeatureCollection,
+      };
+
+      expect(
+        resolveVectorExportLayers({
+          layers: [{ name: 'Upes', url: SOURCE }, inline],
+          name: 'israsas-1',
+        }),
+      ).toHaveLength(2);
+    });
+  });
+
   describe('duplicate layer names', () => {
     it('rejects an exact duplicate', () => {
       const layers = [layer('places'), layer('places')];
@@ -290,6 +361,13 @@ const exportTo = async (format: VectorExportFormat, dir: string) => {
   return { target, filename, size, contentType };
 };
 
+const featureCountOf = (dataset: string, layer: string) =>
+  Number(
+    execFileSync('ogrinfo', ['-so', dataset, layer], { encoding: 'utf8' }).match(
+      /Feature Count: (\d+)/,
+    )?.[1],
+  );
+
 const fieldNamesOf = (dataset: string, layer: string) =>
   execFileSync('ogrinfo', ['-so', dataset, layer], { encoding: 'utf8' })
     .split('\n')
@@ -378,6 +456,105 @@ describeIfOgr('runVectorExport', () => {
     await expect(
       runVectorExport({ layers, name: 'israsas-1', srid: 3346, format: SHP_FORMAT }),
     ).rejects.toMatchObject({ type: 'OGR2OGR_FAILED' });
+  });
+
+  describe('a layer fetched from a url', () => {
+    let server: Server;
+    let origin: string;
+    let body: string;
+    let contentType: string;
+
+    beforeEach(async () => {
+      body = JSON.stringify(polygonFC);
+      contentType = 'application/geo+json';
+      server = createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': contentType });
+        res.end(body);
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      origin = `http://127.0.0.1:${port}`;
+      process.env.VECTOR_EXPORT_SOURCE_HOSTS = `127.0.0.1:${port}`;
+    });
+
+    afterEach(async () => {
+      delete process.env.VECTOR_EXPORT_SOURCE_HOSTS;
+      delete process.env.VECTOR_EXPORT_MAX_SOURCE_BYTES;
+      await new Promise((resolve) => server.close(resolve));
+    });
+
+    const exportUrlLayer = async (format: VectorExportFormat) => {
+      const { stream, filename } = await runVectorExport({
+        layers: [
+          {
+            name: 'Radavietes',
+            url: `${origin}/Radavietes.geojson`,
+            fields: [{ name: 'placeId', shortName: 'RADAV_ID', type: 'Integer' }],
+          },
+        ],
+        name: 'israsas-1',
+        srid: 3346,
+        format,
+      });
+      const target = join(dir, filename);
+      await pipeline(stream, createWriteStream(target));
+      return target;
+    };
+
+    it('produces the same dataset as the identical inline layer', async () => {
+      const fromUrl = await exportUrlLayer(GPKG_FORMAT);
+
+      const { stream } = await runVectorExport({
+        layers: [
+          {
+            name: 'Radavietes',
+            geojson: polygonFC,
+            fields: [{ name: 'placeId', shortName: 'RADAV_ID', type: 'Integer' }],
+          },
+        ],
+        name: 'inline-1',
+        srid: 3346,
+        format: GPKG_FORMAT,
+      });
+      const inline = join(dir, 'inline-1.gpkg');
+      await pipeline(stream, createWriteStream(inline));
+
+      expect(fieldNamesOf(fromUrl, 'Radavietes')).toEqual(fieldNamesOf(inline, 'Radavietes'));
+      expect(featureCountOf(fromUrl, 'Radavietes')).toBe(featureCountOf(inline, 'Radavietes'));
+    });
+
+    it('fails when the source is not GeoJSON', async () => {
+      body = '<html>Access denied</html>';
+      contentType = 'text/html';
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
+        type: 'OGR2OGR_FAILED',
+      });
+    });
+
+    it('refuses a source past the byte cap', async () => {
+      process.env.VECTOR_EXPORT_MAX_SOURCE_BYTES = '16';
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
+        type: 'SOURCE_TOO_LARGE',
+      });
+    });
+
+    it('reports a source the server refuses', async () => {
+      server.close();
+      server = createServer((_req, res) => {
+        res.writeHead(403, { 'Content-Type': 'application/xml' });
+        res.end('<Error><Code>AccessDenied</Code></Error>');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      origin = `http://127.0.0.1:${port}`;
+      process.env.VECTOR_EXPORT_SOURCE_HOSTS = `127.0.0.1:${port}`;
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
+        type: 'SOURCE_FETCH_FAILED',
+      });
+    });
   });
 
   it('keeps a declared field no feature carries, as a null column', async () => {
