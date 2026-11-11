@@ -4,7 +4,6 @@ import moleculer, { Context } from 'moleculer';
 import { Action, Service } from 'moleculer-decorators';
 import {
   GDB_FORMAT,
-  VECTOR_EXPORT_TIMEOUT_MS,
   VectorExportFeatureCollection,
   runVectorExport,
   VectorExportLayer,
@@ -32,7 +31,8 @@ export default class GdbService extends moleculer.Service {
     },
     params: vectorExportParams,
     rest: ['POST /'],
-    timeout: VECTOR_EXPORT_TIMEOUT_MS,
+    // A conversion of real size is never cut short.
+    timeout: 0,
   })
   async create(
     ctx: Context<

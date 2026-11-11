@@ -16,8 +16,8 @@ import {
   runVectorExport,
   SHP_FORMAT,
   sweepAbandonedStream,
-  VECTOR_EXPORT_STREAM_MAX_MS,
-  VECTOR_EXPORT_TIMEOUT_MS,
+  DOWNLOAD_IDLE_SWEEP_MS,
+  DOWNLOAD_MAX_MS,
   VectorExportFormat,
   VectorExportLayer,
 } from './vector-export';
@@ -429,7 +429,7 @@ describe('sweepAbandonedStream', () => {
 
     for (let i = 0; i < 3; i++) {
       stream.bytesRead += 64 * 1024;
-      jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+      jest.advanceTimersByTime(DOWNLOAD_IDLE_SWEEP_MS);
     }
 
     expect(onAbandoned).not.toHaveBeenCalled();
@@ -439,7 +439,7 @@ describe('sweepAbandonedStream', () => {
     const onAbandoned = jest.fn();
     sweepAbandonedStream({ bytesRead: 0 }, onAbandoned);
 
-    jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+    jest.advanceTimersByTime(DOWNLOAD_IDLE_SWEEP_MS);
 
     expect(onAbandoned).toHaveBeenCalledTimes(1);
   });
@@ -450,9 +450,9 @@ describe('sweepAbandonedStream', () => {
     sweepAbandonedStream(stream, onAbandoned);
 
     const start = Date.now();
-    while (Date.now() - start <= VECTOR_EXPORT_STREAM_MAX_MS) {
+    while (Date.now() - start <= DOWNLOAD_MAX_MS) {
       stream.bytesRead += 1;
-      jest.advanceTimersByTime(VECTOR_EXPORT_TIMEOUT_MS);
+      jest.advanceTimersByTime(DOWNLOAD_IDLE_SWEEP_MS);
     }
 
     expect(onAbandoned).toHaveBeenCalledTimes(1);

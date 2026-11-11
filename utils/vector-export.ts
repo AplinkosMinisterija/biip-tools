@@ -13,15 +13,10 @@ export const MAX_LAYERS = 32;
 export const MAX_FIELDS = 255;
 export const MAX_TOTAL_FEATURES = 500_000;
 
-// Under undici's 300s header deadline: a caller on node's global fetch cannot
-// wait longer, so a bigger budget only buys an opaque "fetch failed".
-export const VECTOR_EXPORT_TIMEOUT_MS = 4 * 60 * 1000;
-
+// These bound an abandoned DOWNLOAD; a conversion of real size is never cut short.
+export const DOWNLOAD_IDLE_SWEEP_MS = 4 * 60 * 1000;
 // A trickling client keeps the progress check happy forever, so the download gets a ceiling of its own.
-export const VECTOR_EXPORT_STREAM_MAX_MS = 4 * VECTOR_EXPORT_TIMEOUT_MS;
-
-// Per-process ceiling, applied on top of whatever is left of the deadline.
-const SUBPROCESS_TIMEOUT_MS = 2 * 60 * 1000;
+export const DOWNLOAD_MAX_MS = 4 * DOWNLOAD_IDLE_SWEEP_MS;
 
 // GDAL emits one warning per feature for common cases (e.g. MultiPolygon
 // features into a Polygon layer), so an uncapped stderr buffer grows with
@@ -303,7 +298,7 @@ export function sweepAbandonedStream(
   stream: { bytesRead: number },
   onAbandoned: () => void,
 ): NodeJS.Timeout {
-  const hardDeadline = Date.now() + VECTOR_EXPORT_STREAM_MAX_MS;
+  const hardDeadline = Date.now() + DOWNLOAD_MAX_MS;
   let lastBytesRead = 0;
   const sweep = setInterval(() => {
     const stalled = stream.bytesRead === lastBytesRead;
@@ -312,7 +307,7 @@ export function sweepAbandonedStream(
 
     clearInterval(sweep);
     onAbandoned();
-  }, VECTOR_EXPORT_TIMEOUT_MS);
+  }, DOWNLOAD_IDLE_SWEEP_MS);
   sweep.unref();
   return sweep;
 }
@@ -328,10 +323,6 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
   const isLayerFiles = format.layout === 'layer-files';
   const targetName = isLayerFiles ? name : `${name}.${format.extension}`;
   const targetPath = join(workDir, targetName);
-
-  // One budget for the whole export, so N layers cannot each spend the full
-  // per-process timeout and turn a bounded fan-out into an unbounded runtime.
-  const deadline = Date.now() + VECTOR_EXPORT_TIMEOUT_MS;
 
   try {
     if (isLayerFiles) await fsp.mkdir(targetPath);
@@ -367,7 +358,7 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         isLayerFiles ? join(targetPath, `${layer.name}.${format.extension}`) : targetPath,
         ogrInputPath,
       ];
-      await run('ogr2ogr', ogrArgs, { deadline, logger });
+      await run('ogr2ogr', ogrArgs, { logger });
     }
 
     // `zip` of an empty directory exits 0 with a 176-byte archive.
@@ -383,11 +374,7 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       // "<name>.<ext>/..." (the conventional layout ArcGIS / QGIS expect).
       outPath = join(workDir, `${name}.zip`);
       filename = `${name}.zip`;
-      await run('zip', ['-rq', outPath, targetName], {
-        cwd: workDir,
-        deadline,
-        logger,
-      });
+      await run('zip', ['-rq', outPath, targetName], { cwd: workDir, logger });
     }
 
     const stat = await fsp.stat(outPath).catch(() => null);
@@ -484,9 +471,6 @@ function escapeXml(s: string): string {
 
 interface RunOptions {
   cwd?: string;
-  // Absolute epoch ms by which the whole export must be done. The child gets
-  // whatever is left of it, capped at SUBPROCESS_TIMEOUT_MS.
-  deadline: number;
   logger?: VectorExportLogger;
 }
 
@@ -495,23 +479,12 @@ interface RunOptions {
 // would otherwise be packaged, uploaded and announced as a finished export.
 const SUBPROCESS_ERROR_LINE = /^ERROR \d+/m;
 
-function run(command: string, args: string[], { cwd, deadline, logger }: RunOptions) {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) {
-    return Promise.reject(
-      new Errors.MoleculerError('export exceeded its time budget', 504, 'EXPORT_TIMEOUT'),
-    );
-  }
-
+function run(command: string, args: string[], { cwd, logger }: RunOptions) {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
-      // Without these the child outlives any broker timeout — the request is
-      // abandoned but GDAL keeps burning CPU until it finishes on its own.
-      timeout: Math.min(remaining, SUBPROCESS_TIMEOUT_MS),
-      killSignal: 'SIGKILL',
     });
 
     // Bounded buffer: keep the head of stderr (where the actionable error is)
@@ -533,14 +506,6 @@ function run(command: string, args: string[], { cwd, deadline, logger }: RunOpti
       // both `message` and `data` straight into the response body, so neither
       // may carry it — it goes to the server log only.
       logger?.error(`${command} failed`, { command, args, code, signal, stderr });
-
-      // spawn's `timeout` kills with killSignal, so a null exit code plus our
-      // signal means we ran out of budget rather than hitting a data error.
-      if (signal === 'SIGKILL') {
-        return reject(
-          new Errors.MoleculerError(`${command} exceeded its time budget`, 504, 'EXPORT_TIMEOUT'),
-        );
-      }
 
       reject(
         new Errors.MoleculerError(
