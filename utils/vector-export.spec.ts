@@ -363,6 +363,7 @@ describeIfOgr('runVectorExport', () => {
   });
 
   it('fails when ogr2ogr reports an error on stderr but still exits 0', async () => {
+    // A rename is the one case with an explicit VRT `src`, which GDAL errors on.
     const layers: VectorExportLayer[] = [
       {
         name: 'Radavietes',
@@ -375,8 +376,36 @@ describeIfOgr('runVectorExport', () => {
     ];
 
     await expect(
-      runVectorExport({ layers, name: 'israsas-1', srid: 3346, format: GPKG_FORMAT }),
+      runVectorExport({ layers, name: 'israsas-1', srid: 3346, format: SHP_FORMAT }),
     ).rejects.toMatchObject({ type: 'OGR2OGR_FAILED' });
+  });
+
+  it('keeps a declared field no feature carries, as a null column', async () => {
+    // uetk-api declares a fixed field list, and `JSON.stringify` drops an undefined property.
+    const layers: VectorExportLayer[] = [
+      {
+        name: 'Upes',
+        geojson: polygonFC,
+        fields: [
+          { name: 'placeId', type: 'Integer', alias: 'Radavietės ID' },
+          { name: 'kadastro_id', type: 'String', alias: 'Identifikavimo kodas' },
+        ],
+      },
+    ];
+
+    const { stream, filename } = await runVectorExport({
+      layers,
+      name: 'israsas-1',
+      srid: 3346,
+      format: GPKG_FORMAT,
+    });
+    const target = join(dir, filename);
+    await pipeline(stream, createWriteStream(target));
+
+    expect(fieldNamesOf(target, 'Upes')).toEqual(['placeId', 'kadastro_id']);
+    expect(execFileSync('ogrinfo', ['-so', target, 'Upes'], { encoding: 'utf8' })).toMatch(
+      /Feature Count: 1/,
+    );
   });
 
   it('keeps the full field names in a geopackage holding every layer', async () => {

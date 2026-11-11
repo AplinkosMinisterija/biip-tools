@@ -450,8 +450,9 @@ async function writeVrt(
   const fieldXml = (layer.fields ?? [])
     .map((f) => {
       const exportedName = (shortFieldNames && f.shortName) || f.name;
-      // `src` names the GeoJSON property, so a renamed field still reads it.
-      const attrs = [`name="${escapeXml(exportedName)}"`, `src="${escapeXml(f.name)}"`];
+      // Only when renaming: an explicit `src` that resolves to nothing empties the whole layer, where an implicit one yields a null column.
+      const attrs = [`name="${escapeXml(exportedName)}"`];
+      if (exportedName !== f.name) attrs.push(`src="${escapeXml(f.name)}"`);
       if (f.type) attrs.push(`type="${escapeXml(f.type)}"`);
       if (f.alias) attrs.push(`alternativeName="${escapeXml(f.alias)}"`);
       return `    <Field ${attrs.join(' ')}/>`;
