@@ -1,10 +1,14 @@
 import { Errors } from 'moleculer';
+import Validator from 'fastest-validator';
 import { execFileSync } from 'child_process';
 import { createWriteStream, promises as fsp } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import {
+  VectorExportFeatureCollection,
+  MAX_FIELDS,
+  vectorExportParams,
   GPKG_FORMAT,
   MAX_LAYERS,
   MAX_TOTAL_FEATURES,
@@ -45,12 +49,64 @@ const codeOf = (fn: () => unknown): string | undefined => {
   return undefined;
 };
 
+describe('vectorExportParams', () => {
+  const validator = new Validator();
+  const check = validator.compile({ ...vectorExportParams, $$strict: false });
+
+  const layerWith = (over: Record<string, unknown>) => ({
+    name: 'israsas-1',
+    srid: 3346,
+    layers: [{ name: 'Radavietes', geojson: polygonFC, ...over }],
+  });
+
+  const errorsOf = (params: unknown) => {
+    const result = check(params as Record<string, unknown>);
+    return Array.isArray(result) ? result.map((e) => `${e.field}:${e.type}`) : [];
+  };
+
+  it('accepts the payload the API sends', () => {
+    expect(errorsOf({ name: 'israsas-1', srid: 3346, layers: twoLayers })).toEqual([]);
+  });
+
+  it('accepts exactly MAX_FIELDS fields', () => {
+    const fields = Array.from({ length: MAX_FIELDS }, (_, i) => ({ name: `f${i}` }));
+
+    expect(errorsOf(layerWith({ fields }))).toEqual([]);
+  });
+
+  it('rejects MAX_FIELDS + 1 — every field becomes a column in the VRT', () => {
+    const fields = Array.from({ length: MAX_FIELDS + 1 }, (_, i) => ({ name: `f${i}` }));
+
+    expect(errorsOf(layerWith({ fields }))).toEqual(['layers[0].fields:arrayMax']);
+  });
+
+  it('rejects a control character in a field name — libxml recovers and renames the column', () => {
+    expect(errorsOf(layerWith({ fields: [{ name: 'place\u0001Id' }] }))).toEqual([
+      'layers[0].fields[0].name:stringPattern',
+    ]);
+  });
+
+  it('rejects an srid that is not a whole EPSG code', () => {
+    expect(errorsOf({ name: 'israsas-1', srid: 0.5, layers: twoLayers })).toEqual([
+      'srid:numberMin',
+      'srid:numberInteger',
+    ]);
+  });
+});
+
 describe('resolveVectorExportLayers', () => {
   describe('input shapes', () => {
     it('wraps single-layer `geojson` into one layer named after the export', () => {
       expect(resolveVectorExportLayers({ geojson: featureCollection(), name: 'extract' })).toEqual([
         { name: 'extract', geojson: featureCollection() },
       ]);
+    });
+
+    it('sanitises the export name when it becomes the single layer name', () => {
+      // `name` is also a filename, so it allows dots a layer name cannot keep.
+      const [layer] = resolveVectorExportLayers({ geojson: polygonFC, name: 'israsas.1-v2' });
+
+      expect(layer.name).toBe('israsas_1_v2');
     });
 
     it('passes `layers` through untouched', () => {
@@ -275,6 +331,32 @@ describeIfOgr('runVectorExport', () => {
       'ANKET_ID',
       'STEB_DATA',
     ]);
+  });
+
+  it('ignores a `name` member in the posted FeatureCollection', async () => {
+    // Most GeoJSON writers emit one, and GDAL names the source layer after it.
+    const layers: VectorExportLayer[] = [
+      {
+        name: 'Radavietes',
+        geojson: { ...polygonFC, name: 'visai_kitas_vardas' } as VectorExportFeatureCollection,
+        fields: [
+          { name: 'placeId', shortName: 'RADAV_ID', type: 'Integer', alias: 'Radavietės ID' },
+        ],
+      },
+    ];
+
+    const { stream, filename } = await runVectorExport({
+      layers,
+      name: 'israsas-1',
+      srid: 3346,
+      format: GPKG_FORMAT,
+    });
+
+    const target = join(dir, filename);
+    await pipeline(stream, createWriteStream(target));
+
+    const info = execFileSync('ogrinfo', ['-so', target, 'Radavietes'], { encoding: 'utf8' });
+    expect(info).toContain('Feature Count: 1');
   });
 
   it('fails when ogr2ogr reports an error on stderr but still exits 0', async () => {

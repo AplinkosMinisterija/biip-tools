@@ -9,6 +9,8 @@ import { join } from 'path';
 // The endpoints are unauthenticated and a ~137-byte layer costs one GDAL
 // process, so a 25MB body could ask for ~180k sequential ogr2ogr spawns.
 export const MAX_LAYERS = 32;
+// One VRT column per field, and the DBF/GDB ceiling is 255 anyway.
+export const MAX_FIELDS = 255;
 export const MAX_TOTAL_FEATURES = 500_000;
 
 // Under undici's 300s header deadline: a caller on node's global fetch cannot
@@ -89,6 +91,9 @@ export const SHP_FORMAT: VectorExportFormat = {
 // Shared fastest-validator schema for the /gdb and /gpkg actions. The two
 // endpoints deliberately accept identical params so callers can switch
 // export format by changing only the URL.
+// Spelled as a string because fastest-validator compiles `pattern` itself.
+const NO_CONTROL_CHARS = '^[^\\u0000-\\u001f\\u007f]+$';
+
 export const vectorExportParams = {
   // Backward-compatible: pass `geojson` (single FeatureCollection) for a
   // one-layer export, OR pass `layers: [{ name, geojson }]` to produce a
@@ -126,17 +131,19 @@ export const vectorExportParams = {
         // Optional per-field alias / type overrides. When provided, the
         // layer is fed through an OGR VRT wrapper so the exported dataset
         // carries the alternative names (what QGIS / ArcGIS surface in
-        // the attribute table headers). Field names not listed here keep
-        // their inferred String type and no alias.
+        // the attribute table headers). A VRT exposes ONLY the fields it
+        // declares, so a partial list drops every other property.
         fields: {
           type: 'array',
           optional: true,
+          max: MAX_FIELDS,
           items: {
             type: 'object',
             props: {
-              name: 'string',
-              shortName: { type: 'string', optional: true, max: 10 },
-              alias: { type: 'string', optional: true },
+              // libxml recovers from a control character, shipping a silently renamed column.
+              name: { type: 'string', max: 64, pattern: NO_CONTROL_CHARS },
+              shortName: { type: 'string', optional: true, max: 10, pattern: NO_CONTROL_CHARS },
+              alias: { type: 'string', optional: true, max: 128, pattern: NO_CONTROL_CHARS },
               type: {
                 type: 'enum',
                 values: ['String', 'Integer', 'Integer64', 'Real', 'Date', 'DateTime'],
@@ -154,6 +161,9 @@ export const vectorExportParams = {
     type: 'number',
     convert: true,
     optional: true,
+    integer: true,
+    min: 1024,
+    max: 999999,
     default: 3346,
     $$t: 'Source / target SRID. Defaults to 3346 (LKS-94 — Lithuanian national grid)',
   },
@@ -200,15 +210,21 @@ export interface VectorExportResult {
 // enforce every limit, so the rest of the pipeline doesn't branch and the
 // guardrails can be unit-tested without touching the filesystem or GDAL.
 // Pure: throws MoleculerClientError (4xx) on any invalid input.
+const toLayerName = (name: string) => name.replace(/[^A-Za-z0-9ĄČĘĖĮŠŲŪŽąčęėįšųūž_]/g, '_');
+
 export function resolveVectorExportLayers(
   input: Pick<VectorExportInput, 'geojson' | 'layers' | 'name'>,
 ): VectorExportLayer[] {
   const { geojson, layers, name } = input;
 
   // Single-layer callers get an auto-named layer matching the export's `name`
-  // (the historical behaviour).
+  // (the historical behaviour), sanitised: `name` is also a filename, so it allows dots a layer name cannot keep.
   const inputLayers: VectorExportLayer[] =
-    Array.isArray(layers) && layers.length ? layers : geojson ? [{ name, geojson }] : [];
+    Array.isArray(layers) && layers.length
+      ? layers
+      : geojson
+      ? [{ name: toLayerName(name), geojson }]
+      : [];
 
   if (!inputLayers.length) {
     throw new Errors.MoleculerClientError(
@@ -307,7 +323,11 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     for (let i = 0; i < inputLayers.length; i++) {
       const layer = inputLayers[i];
       const layerGeojsonPath = join(workDir, `${layer.name}.geojson`);
-      await fsp.writeFile(layerGeojsonPath, JSON.stringify(layer.geojson));
+      // Only what the layer is: GDAL names the source layer after a root `name` member, which the VRT's SrcLayer would then miss.
+      await fsp.writeFile(
+        layerGeojsonPath,
+        JSON.stringify({ type: 'FeatureCollection', features: layer.geojson.features || [] }),
+      );
 
       const ogrInputPath = layer.fields?.length
         ? await writeVrt(workDir, layer, !!format.shortFieldNames)
@@ -328,6 +348,12 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       await run('ogr2ogr', ogrArgs, { deadline, logger });
     }
 
+    // `zip` of an empty directory exits 0 with a 176-byte archive.
+    if (isLayerFiles && !(await fsp.readdir(targetPath)).length) {
+      logger?.error('vector export produced no layer files', { targetPath });
+      throw new Errors.MoleculerError('export produced no file', 500, 'EXPORT_EMPTY');
+    }
+
     let outPath = targetPath;
     let filename = `${name}.${format.extension}`;
     if (format.packaging === 'zip') {
@@ -342,7 +368,12 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
       });
     }
 
-    const stat = await fsp.stat(outPath);
+    const stat = await fsp.stat(outPath).catch(() => null);
+    // A driver that writes nothing still exits 0, and a raw ENOENT would put the temp path in the response.
+    if (!stat?.size) {
+      logger?.error('vector export produced no file', { outPath });
+      throw new Errors.MoleculerError('export produced no file', 500, 'EXPORT_EMPTY');
+    }
 
     const stream = createReadStream(outPath);
     // Stream ends -> safe to remove the workDir. Errors on the stream
@@ -355,15 +386,23 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     // and the temp dir plus its fd would leak for the life of the process.
     // Repeat that and /tmp fills up. Destroy and sweep once the export's own
     // budget is spent.
-    const sweep = setTimeout(() => {
+    // Progress, not wall clock: a plain timer cut a slow client's download at the budget.
+    let lastBytesRead = 0;
+    const sweep = setInterval(() => {
+      if (stream.bytesRead !== lastBytesRead) {
+        lastBytesRead = stream.bytesRead;
+        return;
+      }
+
       logger?.error('vector export stream abandoned, sweeping temp dir', { workDir });
+      clearInterval(sweep);
       stream.destroy();
       cleanup();
     }, VECTOR_EXPORT_TIMEOUT_MS);
     sweep.unref();
 
     const finish = () => {
-      clearTimeout(sweep);
+      clearInterval(sweep);
       cleanup();
     };
     stream.on('close', finish);
