@@ -17,6 +17,8 @@ export const MAX_LAYERS = 32;
 export const MAX_FIELDS = 255;
 export const MAX_TOTAL_FEATURES = 500_000;
 
+// The `type` member has to fall inside this window, which the writer on the other side puts first.
+const SOURCE_HEAD_BYTES = 512;
 // A url layer is never parsed, so bytes on disk are the only countable limit.
 const DEFAULT_MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024;
 
@@ -401,6 +403,8 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         : layerGeojsonPath;
 
       const ogrArgs = [
+        // A `gdal_streamed_alg` json carries a gdal command line of its own, and reaches a local path through a fetched file or through the SrcDataSource of the vrt below, where `-if` has no say.
+        ...(layer.url ? ['--config', 'OGR_SKIP', 'GDALG'] : []),
         '-f',
         format.ogrDriver,
         '-a_srs',
@@ -525,6 +529,19 @@ async function fetchSource(url: string, path: string, budget: SourceBudget): Pro
   });
 
   await pipeline(response, counted, createWriteStream(path));
+
+  // Answers the wrong object with a clear 422 instead of an opaque ogr2ogr error, and keeps an XML VRT from being opened as a datasource of its own; a json head alone is not the guard, the driver skip is.
+  const head = Buffer.alloc(SOURCE_HEAD_BYTES);
+  const handle = await fsp.open(path, 'r');
+  const { bytesRead } = await handle.read(head, 0, head.length, 0).finally(() => handle.close());
+  const headText = head.subarray(0, bytesRead).toString('utf8');
+  if (!/^\s*\{/.test(headText) || !/"type"\s*:\s*"FeatureCollection"/.test(headText)) {
+    throw new Errors.MoleculerError(
+      'source must open as a GeoJSON FeatureCollection',
+      422,
+      'SOURCE_NOT_GEOJSON',
+    );
+  }
 }
 
 async function writeVrt(

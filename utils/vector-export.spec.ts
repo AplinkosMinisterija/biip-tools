@@ -458,7 +458,7 @@ describeIfOgr('runVectorExport', () => {
     ).rejects.toMatchObject({ type: 'OGR2OGR_FAILED' });
   });
 
-  describe('a layer fetched from a url', () => {
+  describeIfOgr('a layer fetched from a url', () => {
     let server: Server;
     let origin: string;
     let body: string;
@@ -523,12 +523,24 @@ describeIfOgr('runVectorExport', () => {
       expect(featureCountOf(fromUrl, 'Radavietes')).toBe(featureCountOf(inline, 'Radavietes'));
     });
 
-    it('fails when the source is not GeoJSON', async () => {
-      body = '<html>Access denied</html>';
-      contentType = 'text/html';
+    it('refuses a source that names a gdal command line of its own', async () => {
+      // The nested decoy satisfies any text check for a FeatureCollection, so only the skipped driver can stop this.
+      body =
+        '{"type":"gdal_streamed_alg","command_line":"vector convert /etc/hosts out.geojson","decoy":{"type":"FeatureCollection"}}';
 
       await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
         type: 'OGR2OGR_FAILED',
+      });
+    });
+
+    it('refuses a source that is not a json document', async () => {
+      // A crafted VRT at an allowlisted host would otherwise make GDAL open whatever datasource it names, including a local file.
+      body =
+        '<OGRVRTDataSource><OGRVRTLayer name="x"><SrcDataSource>/etc/hostname</SrcDataSource></OGRVRTLayer></OGRVRTDataSource>';
+      contentType = 'application/xml';
+
+      await expect(exportUrlLayer(GPKG_FORMAT)).rejects.toMatchObject({
+        type: 'SOURCE_NOT_GEOJSON',
       });
     });
 
