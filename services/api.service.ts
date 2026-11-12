@@ -1,5 +1,5 @@
 import moleculer from 'moleculer';
-import { Action, Service } from 'moleculer-decorators';
+import { Service } from 'moleculer-decorators';
 import ApiGateway from 'moleculer-web';
 
 @Service({
@@ -90,9 +90,7 @@ import ApiGateway from 'moleculer-web';
         callingOptions: {},
 
         bodyParsers: {
-          // 25MB accommodates GeoJSON payloads for the /gdb endpoint, which
-          // can be several MB for requests with many objects. Other endpoints
-          // (/pdf, /download, /screenshot) take URL params and are unaffected.
+          // The vector endpoints post GeoJSON, which runs to several MB.
           json: {
             strict: false,
             limit: '25MB',
