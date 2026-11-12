@@ -652,6 +652,21 @@ describeIfOgr('runVectorExport', () => {
     );
   });
 
+  it('stores the QGIS style inside the geopackage, which has no sidecar to carry one', async () => {
+    const { target } = await exportTo(GPKG_FORMAT, dir);
+
+    const styles = execFileSync(
+      'ogrinfo',
+      ['-ro', '-q', target, '-sql', 'SELECT f_table_name, useAsDefault, styleQML FROM layer_styles'],
+      { encoding: 'utf8' },
+    );
+
+    expect(styles).toContain('f_table_name (String) = Radavietes');
+    expect(styles).toContain('f_table_name (String) = Stebejimai');
+    expect(styles).toContain('useAsDefault (Integer(Boolean)) = 1');
+    expect(styles).toContain('class="CentroidFill"');
+  });
+
   it('keeps the full field names in a geopackage holding every layer', async () => {
     const { target, filename, contentType } = await exportTo(GPKG_FORMAT, dir);
 
