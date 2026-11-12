@@ -451,10 +451,12 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         ogrInputPath,
       ];
       await run('ogr2ogr', ogrArgs, { logger });
+      if (isLayerFiles) await writeLayerStyle(targetPath, layer.name, logger);
     }
 
+    const produced = isLayerFiles ? await fsp.readdir(targetPath) : [];
     // `zip` of an empty directory exits 0 with a 176-byte archive.
-    if (isLayerFiles && !(await fsp.readdir(targetPath)).length) {
+    if (isLayerFiles && !produced.length) {
       logger?.error('vector export produced no layer files', { targetPath });
       throw new Errors.MoleculerError('export produced no file', 500, 'EXPORT_EMPTY');
     }
@@ -462,11 +464,14 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
     let outPath = targetPath;
     let filename = `${name}.${format.extension}`;
     if (format.packaging === 'zip') {
-      // Pack the dataset at workDir root so the archive entry is
-      // "<name>.<ext>/..." (the conventional layout ArcGIS / QGIS expect).
       outPath = join(workDir, `${name}.zip`);
       filename = `${name}.zip`;
-      await run('zip', ['-rq', outPath, targetName], { cwd: workDir, logger });
+      // Layer files go in AT the archive root, so `/vsizip/<zip>` is itself the
+      // dataset: a wrapper folder makes QGIS refuse the archive it was handed.
+      await run('zip', ['-rq', outPath, ...(isLayerFiles ? produced : [targetName])], {
+        cwd: isLayerFiles ? targetPath : workDir,
+        logger,
+      });
     }
 
     const stat = await fsp.stat(outPath).catch(() => null);
@@ -504,6 +509,140 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
   } catch (e) {
     await fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
     throw e;
+  }
+}
+
+type StyleGeometry = 'point' | 'line' | 'polygon';
+
+// Shape type from the little-endian int32 at byte 32 of the .shp header.
+const SHAPE_TYPE_GEOMETRY: Record<number, StyleGeometry> = {
+  1: 'point',
+  3: 'line',
+  5: 'polygon',
+  8: 'point',
+  11: 'point',
+  13: 'line',
+  15: 'polygon',
+  18: 'point',
+  21: 'point',
+  23: 'line',
+  25: 'polygon',
+  28: 'point',
+  31: 'polygon',
+};
+
+// QgsWkbTypes::GeometryType — QGIS refuses a style whose type is not the layer's.
+const STYLE_GEOMETRY_CODE: Record<StyleGeometry, number> = { point: 0, line: 1, polygon: 2 };
+
+const STYLE_COLOR = '227,26,28';
+
+const styleProps = (values: Record<string, string>) =>
+  Object.entries(values)
+    .map(([k, v]) => `<prop k="${k}" v="${v}"/>`)
+    .join('');
+
+// A fixed 3mm circle, the way the PDF map draws one: a 3m² hull covers less
+// than a pixel, so without it a real extract reads as an empty map.
+const markerSymbol = (name: string) =>
+  `<symbol type="marker" name="${name}" alpha="1" clip_to_extent="1" force_rhr="0">` +
+  `<layer class="SimpleMarker" enabled="1" locked="0" pass="0">` +
+  styleProps({
+    name: 'circle',
+    color: `${STYLE_COLOR},255`,
+    outline_color: '255,255,255,255',
+    outline_width: '0.4',
+    outline_width_unit: 'MM',
+    size: '3',
+    size_unit: 'MM',
+    scale_method: 'diameter',
+    angle: '0',
+    offset: '0,0',
+    offset_unit: 'MM',
+    horizontal_anchor_point: '1',
+    vertical_anchor_point: '1',
+    joinstyle: 'bevel',
+  }) +
+  '</layer></symbol>';
+
+const STYLE_SYMBOLS: Record<StyleGeometry, () => string> = {
+  point: () => markerSymbol('0'),
+  line: () =>
+    '<symbol type="line" name="0" alpha="1" clip_to_extent="1" force_rhr="0">' +
+    '<layer class="SimpleLine" enabled="1" locked="0" pass="0">' +
+    styleProps({
+      line_color: `${STYLE_COLOR},255`,
+      line_width: '0.6',
+      line_width_unit: 'MM',
+      line_style: 'solid',
+      capstyle: 'square',
+      joinstyle: 'bevel',
+      offset: '0',
+      offset_unit: 'MM',
+    }) +
+    '</layer></symbol>',
+  polygon: () =>
+    '<symbol type="fill" name="0" alpha="1" clip_to_extent="1" force_rhr="0">' +
+    '<layer class="SimpleFill" enabled="1" locked="0" pass="0">' +
+    styleProps({
+      style: 'solid',
+      color: `${STYLE_COLOR},90`,
+      outline_style: 'solid',
+      outline_color: `${STYLE_COLOR},255`,
+      outline_width: '0.4',
+      outline_width_unit: 'MM',
+      joinstyle: 'bevel',
+      offset: '0,0',
+      offset_unit: 'MM',
+    }) +
+    '</layer>' +
+    '<layer class="CentroidFill" enabled="1" locked="0" pass="0">' +
+    styleProps({
+      point_on_all_parts: '1',
+      point_on_surface: '0',
+      clip_on_current_part_only: '0',
+      clip_points: '0',
+    }) +
+    markerSymbol('@0@1') +
+    '</layer></symbol>',
+};
+
+function qmlDocument(geometry: StyleGeometry): string {
+  return [
+    "<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>",
+    '<qgis version="3.28.0" styleCategories="Symbology">',
+    '  <renderer-v2 type="singleSymbol" forceraster="0" symbollevels="0" enableorderby="0">',
+    `    <symbols>${STYLE_SYMBOLS[geometry]()}</symbols>`,
+    '  </renderer-v2>',
+    `  <layerGeometryType>${STYLE_GEOMETRY_CODE[geometry]}</layerGeometryType>`,
+    '</qgis>',
+    '',
+  ].join('\n');
+}
+
+// QGIS loads `<basename>.qml` beside a shapefile by itself, which is the only
+// hook an exported file has for carrying symbology.
+async function writeLayerStyle(
+  dir: string,
+  layerName: string,
+  logger?: VectorExportLogger,
+): Promise<void> {
+  try {
+    const header = Buffer.alloc(36);
+    const handle = await fsp.open(join(dir, `${layerName}.shp`), 'r');
+    const { bytesRead } = await handle
+      .read(header, 0, header.length, 0)
+      .finally(() => handle.close());
+
+    const geometry = bytesRead === header.length && SHAPE_TYPE_GEOMETRY[header.readInt32LE(32)];
+    if (!geometry) return;
+
+    await fsp.writeFile(join(dir, `${layerName}.qml`), qmlDocument(geometry));
+  } catch (e: unknown) {
+    // Symbology is a nicety and the layer itself is the deliverable, so losing one must not sink the export.
+    logger?.error('vector export could not write a layer style', {
+      layerName,
+      error: e instanceof Error ? e.message : String(e),
+    });
   }
 }
 
