@@ -71,11 +71,14 @@ export interface VectorExportLayer {
 
 // `packaging`: GDB and Shapefile produce a directory to zip, GPKG one file.
 // `layout`: a .gdb holds every layer, a Shapefile directory one set per layer.
+// `styling`: where a QGIS style can live — beside the layer file, inside the
+// dataset, or nowhere at all, which is the case for a .gdb.
 export interface VectorExportFormat {
   ogrDriver: 'OpenFileGDB' | 'GPKG' | 'ESRI Shapefile';
   extension: 'gdb' | 'gpkg' | 'shp';
   packaging: 'zip' | 'raw';
   layout: 'dataset' | 'layer-files';
+  styling: 'sidecar' | 'table' | 'none';
   contentType: string;
   // The DBF header has no room for an alias and caps a field name at 10
   // characters, so Shapefile exports use the caller's shortName instead.
@@ -88,6 +91,7 @@ export const GDB_FORMAT: VectorExportFormat = {
   extension: 'gdb',
   packaging: 'zip',
   layout: 'dataset',
+  styling: 'none',
   contentType: 'application/zip',
 };
 
@@ -96,6 +100,7 @@ export const GPKG_FORMAT: VectorExportFormat = {
   extension: 'gpkg',
   packaging: 'raw',
   layout: 'dataset',
+  styling: 'table',
   contentType: 'application/geopackage+sqlite3',
 };
 
@@ -104,6 +109,7 @@ export const SHP_FORMAT: VectorExportFormat = {
   extension: 'shp',
   packaging: 'zip',
   layout: 'layer-files',
+  styling: 'sidecar',
   contentType: 'application/zip',
   shortFieldNames: true,
   // Without this the .dbf is written as ISO-8859-1 and every Lithuanian
@@ -451,8 +457,9 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
         ogrInputPath,
       ];
       await run('ogr2ogr', ogrArgs, { logger });
-      if (isLayerFiles) await writeLayerStyle(targetPath, layer.name, logger);
     }
+
+    await attachStyles(targetPath, inputLayers, format, logger);
 
     const produced = isLayerFiles ? await fsp.readdir(targetPath) : [];
     // `zip` of an empty directory exits 0 with a 176-byte archive.
@@ -513,23 +520,6 @@ export async function runVectorExport(input: VectorExportInput): Promise<VectorE
 }
 
 type StyleGeometry = 'point' | 'line' | 'polygon';
-
-// Shape type from the little-endian int32 at byte 32 of the .shp header.
-const SHAPE_TYPE_GEOMETRY: Record<number, StyleGeometry> = {
-  1: 'point',
-  3: 'line',
-  5: 'polygon',
-  8: 'point',
-  11: 'point',
-  13: 'line',
-  15: 'polygon',
-  18: 'point',
-  21: 'point',
-  23: 'line',
-  25: 'polygon',
-  28: 'point',
-  31: 'polygon',
-};
 
 // QgsWkbTypes::GeometryType — QGIS refuses a style whose type is not the layer's.
 const STYLE_GEOMETRY_CODE: Record<StyleGeometry, number> = { point: 0, line: 1, polygon: 2 };
@@ -619,28 +609,90 @@ function qmlDocument(geometry: StyleGeometry): string {
   ].join('\n');
 }
 
-// QGIS loads `<basename>.qml` beside a shapefile by itself, which is the only
-// hook an exported file has for carrying symbology.
-async function writeLayerStyle(
-  dir: string,
+// QGIS keeps a geopackage's styles in a table of its own, and reads the default
+// one straight from the provider — the only style that survives without unzipping.
+const QGIS_STYLE_TABLE =
+  'CREATE TABLE IF NOT EXISTS layer_styles (id INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+  'f_table_catalog TEXT, f_table_schema TEXT, f_table_name TEXT, f_geometry_column TEXT, ' +
+  'styleName TEXT, styleQML TEXT, styleSLD TEXT, useAsDefault BOOLEAN, description TEXT, ' +
+  "owner TEXT, ui TEXT, update_time DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))";
+
+const quoteSql = (value: string) => `'${value.replace(/'/g, "''")}'`;
+
+const WKT_STYLE_GEOMETRY: Record<string, StyleGeometry> = {
+  POINT: 'point',
+  MULTIPOINT: 'point',
+  LINESTRING: 'line',
+  MULTILINESTRING: 'line',
+  POLYGON: 'polygon',
+  MULTIPOLYGON: 'polygon',
+};
+
+// The layer header reads "Unknown (any)" as soon as a layer mixes Polygon with
+// MultiPolygon, so the shape comes from a feature instead.
+async function layerGeometry(
+  dataset: string,
   layerName: string,
   logger?: VectorExportLogger,
+): Promise<StyleGeometry | undefined> {
+  const info = await run(
+    'ogrinfo',
+    [
+      '-ro',
+      '-q',
+      dataset,
+      '-dialect',
+      'OGRSQL',
+      '-sql',
+      `SELECT OGR_GEOMETRY FROM "${layerName.replace(/"/g, '""')}" LIMIT 1`,
+    ],
+    { logger },
+  );
+
+  const wkt = info.match(/OGR_GEOMETRY \(String\) = (\w+)/)?.[1] || '';
+  return WKT_STYLE_GEOMETRY[wkt.toUpperCase().replace(/25D$/, '')];
+}
+
+// QGIS loads `<basename>.qml` beside a shapefile by itself; a geopackage carries
+// the same document in `layer_styles`. A .gdb has nowhere to put one.
+async function attachStyles(
+  target: string,
+  layers: VectorExportLayer[],
+  format: VectorExportFormat,
+  logger?: VectorExportLogger,
 ): Promise<void> {
+  if (format.styling === 'none') return;
+
   try {
-    const header = Buffer.alloc(36);
-    const handle = await fsp.open(join(dir, `${layerName}.shp`), 'r');
-    const { bytesRead } = await handle
-      .read(header, 0, header.length, 0)
-      .finally(() => handle.close());
+    if (format.styling === 'table') await run('ogrinfo', [target, '-sql', QGIS_STYLE_TABLE], { logger });
 
-    const geometry = bytesRead === header.length && SHAPE_TYPE_GEOMETRY[header.readInt32LE(32)];
-    if (!geometry) return;
+    for (const layer of layers) {
+      const sidecar = format.styling === 'sidecar';
+      const dataset = sidecar ? join(target, `${layer.name}.${format.extension}`) : target;
+      const geometry = await layerGeometry(dataset, layer.name, logger);
+      if (!geometry) continue;
 
-    await fsp.writeFile(join(dir, `${layerName}.qml`), qmlDocument(geometry));
+      const qml = qmlDocument(geometry);
+      if (sidecar) {
+        await fsp.writeFile(join(target, `${layer.name}.qml`), qml);
+        continue;
+      }
+
+      await run(
+        'ogrinfo',
+        [
+          target,
+          '-sql',
+          'INSERT INTO layer_styles (f_table_catalog, f_table_schema, f_table_name, ' +
+            'f_geometry_column, styleName, styleQML, useAsDefault) VALUES ' +
+            `('', '', ${quoteSql(layer.name)}, 'geom', ${quoteSql(layer.name)}, ${quoteSql(qml)}, 1)`,
+        ],
+        { logger },
+      );
+    }
   } catch (e: unknown) {
-    // Symbology is a nicety and the layer itself is the deliverable, so losing one must not sink the export.
-    logger?.error('vector export could not write a layer style', {
-      layerName,
+    // Symbology is a nicety and the layers themselves are the deliverable, so losing it must not sink the export.
+    logger?.error('vector export could not attach the layer styles', {
       error: e instanceof Error ? e.message : String(e),
     });
   }
@@ -779,26 +831,33 @@ interface RunOptions {
 const SUBPROCESS_ERROR_LINE = /^ERROR \d+/m;
 
 function run(command: string, args: string[], { cwd, logger }: RunOptions) {
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<string>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
     });
 
-    // Bounded buffer: keep the head of stderr (where the actionable error is)
-    // and drop the rest rather than growing with feature count.
+    // Bounded buffers: keep the head of each stream (where the actionable error,
+    // and the answer to a query, is) rather than growing with feature count. An
+    // unread stdout pipe would also block a chatty child once it fills.
     let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => {
-      if (stderr.length < MAX_STDERR_CHARS) {
+    let stdout = '';
+    const collect = (into: 'out' | 'err') => (chunk: string) => {
+      if (into === 'out' && stdout.length < MAX_STDERR_CHARS) {
+        stdout += chunk.slice(0, MAX_STDERR_CHARS - stdout.length);
+      } else if (into === 'err' && stderr.length < MAX_STDERR_CHARS) {
         stderr += chunk.slice(0, MAX_STDERR_CHARS - stderr.length);
       }
-    });
+    };
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', collect('err'));
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', collect('out'));
 
     child.on('error', reject);
     child.on('close', (code, signal) => {
-      if (code === 0 && !SUBPROCESS_ERROR_LINE.test(stderr)) return resolve();
+      if (code === 0 && !SUBPROCESS_ERROR_LINE.test(stderr)) return resolve(stdout);
 
       // stderr carries absolute temp paths, GDAL/PROJ versions and sometimes
       // fragments of the submitted data. moleculer-web's reformatError copies
