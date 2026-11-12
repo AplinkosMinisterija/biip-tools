@@ -385,30 +385,53 @@ describeIfOgr('runVectorExport', () => {
     await fsp.rm(dir, { recursive: true, force: true });
   });
 
-  it('packages one shapefile per layer into a zip named after the export', async () => {
+  it('packages the shapefiles at the archive root, so the zip itself opens as a dataset', async () => {
     const { target, filename, size, contentType } = await exportTo(SHP_FORMAT, dir);
 
     expect(filename).toBe('israsas-1.zip');
     expect(contentType).toBe('application/zip');
     expect(size).toBeGreaterThan(0);
 
-    const entries = execFileSync('unzip', ['-Z1', target], { encoding: 'utf8' }).split('\n');
-    expect(entries).toContain('israsas-1/Radavietes.shp');
-    expect(entries).toContain('israsas-1/Stebejimai.shp');
-    expect(entries).toContain('israsas-1/Radavietes.dbf');
-    expect(entries).toContain('israsas-1/Radavietes.prj');
+    const entries = execFileSync('unzip', ['-Z1', target], { encoding: 'utf8' })
+      .split('\n')
+      .filter(Boolean);
+    expect(entries).toEqual(
+      expect.arrayContaining([
+        'Radavietes.shp',
+        'Radavietes.dbf',
+        'Radavietes.prj',
+        'Stebejimai.shp',
+      ]),
+    );
+    expect(entries.filter((entry) => entry.includes('/'))).toEqual([]);
+    expect(featureCountOf(`/vsizip/${target}`, 'Radavietes')).toBe(1);
+  });
+
+  it('ships a QGIS style beside each shapefile, so a sub-pixel hull still shows up', async () => {
+    const { target } = await exportTo(SHP_FORMAT, dir);
+    execFileSync('unzip', ['-q', target, '-d', dir]);
+
+    const places = await fsp.readFile(join(dir, 'Radavietes.qml'), 'utf8');
+    const observations = await fsp.readFile(join(dir, 'Stebejimai.qml'), 'utf8');
+
+    expect(places).toContain('<symbol type="fill"');
+    expect(places).toContain('class="CentroidFill"');
+    expect(places).toContain('<layerGeometryType>2</layerGeometryType>');
+    expect(observations).toContain('<symbol type="marker"');
+    expect(observations).not.toContain('CentroidFill');
+    expect(observations).toContain('<layerGeometryType>0</layerGeometryType>');
   });
 
   it('renames shapefile fields to their shortName — DBF caps a name at 10 characters', async () => {
     const { target } = await exportTo(SHP_FORMAT, dir);
     execFileSync('unzip', ['-q', target, '-d', dir]);
 
-    expect(fieldNamesOf(join(dir, 'israsas-1', 'Radavietes.shp'), 'Radavietes')).toEqual([
+    expect(fieldNamesOf(join(dir, 'Radavietes.shp'), 'Radavietes')).toEqual([
       'RADAV_ID',
       'RADAV_KOD',
       'SUKURTA',
     ]);
-    expect(fieldNamesOf(join(dir, 'israsas-1', 'Stebejimai.shp'), 'Stebejimai')).toEqual([
+    expect(fieldNamesOf(join(dir, 'Stebejimai.shp'), 'Stebejimai')).toEqual([
       'ANKET_ID',
       'STEB_DATA',
     ]);
