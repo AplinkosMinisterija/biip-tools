@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import { createReadStream, createWriteStream, promises as fsp } from 'fs';
 import { get as httpGet, IncomingMessage } from 'http';
 import { get as httpsGet } from 'https';
-import { Errors } from 'moleculer';
+import { Context, Errors } from 'moleculer';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Transform } from 'stream';
@@ -231,7 +231,39 @@ export interface VectorExportResult {
   contentType: string;
 }
 
-// Full export pipeline shared by the /gdb and /gpkg endpoints:
+export interface VectorExportMeta {
+  $responseType: string;
+  $statusCode: number;
+  $responseHeaders: Record<string, string>;
+}
+
+export type VectorExportContext = Context<
+  Pick<VectorExportInput, 'geojson' | 'layers' | 'srid' | 'name'>,
+  VectorExportMeta
+>;
+
+export async function respondWithVectorExport(
+  ctx: VectorExportContext,
+  format: VectorExportFormat,
+  logger?: VectorExportLogger,
+): Promise<NodeJS.ReadableStream> {
+  const { stream, size, filename, contentType } = await runVectorExport({
+    ...ctx.params,
+    format,
+    logger,
+  });
+
+  ctx.meta.$responseType = contentType;
+  ctx.meta.$statusCode = 200;
+  ctx.meta.$responseHeaders = {
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Length': size.toString(),
+  };
+
+  return stream;
+}
+
+// Full export pipeline shared by the /shp, /gdb and /gpkg endpoints:
 // validate → temp dir → optional VRT wrapper → ogr2ogr per layer →
 // optional zip → readable stream that removes the temp dir on close.
 // Normalize the two accepted input shapes into a single layers[] list and

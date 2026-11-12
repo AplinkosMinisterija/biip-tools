@@ -1,12 +1,11 @@
 'use strict';
 
-import moleculer, { Context } from 'moleculer';
+import moleculer from 'moleculer';
 import { Action, Service } from 'moleculer-decorators';
 import {
   GPKG_FORMAT,
-  VectorExportFeatureCollection,
-  runVectorExport,
-  VectorExportLayer,
+  respondWithVectorExport,
+  VectorExportContext,
   vectorExportParams,
 } from '../utils/vector-export';
 
@@ -33,34 +32,7 @@ export default class GpkgService extends moleculer.Service {
     // A conversion of real size is never cut short.
     timeout: 0,
   })
-  async create(
-    ctx: Context<
-      {
-        geojson?: VectorExportFeatureCollection;
-        layers?: VectorExportLayer[];
-        srid: number;
-        name: string;
-      },
-      {
-        $responseType: string;
-        $statusCode: number;
-        $responseHeaders: Record<string, string>;
-      }
-    >,
-  ) {
-    const { stream, size, filename, contentType } = await runVectorExport({
-      ...ctx.params,
-      format: GPKG_FORMAT,
-      logger: this.logger,
-    });
-
-    ctx.meta.$responseType = contentType;
-    ctx.meta.$statusCode = 200;
-    ctx.meta.$responseHeaders = {
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      'Content-Length': size.toString(),
-    };
-
-    return stream;
+  async create(ctx: VectorExportContext) {
+    return respondWithVectorExport(ctx, GPKG_FORMAT, this.logger);
   }
 }
